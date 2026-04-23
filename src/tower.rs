@@ -1,0 +1,572 @@
+use crate::{CacheBackend, CachePolicy, ComputeValue, Error, MetricsHooks, Result, SingleFlight};
+use bytes::Bytes;
+use http::{Method, Request, Response, StatusCode, Version};
+use http_body::Body as HttpBody;
+use http_body_util::{BodyExt, Full};
+use std::{
+    error::Error as StdError,
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::sync::Mutex;
+use tower::{Layer, Service, ServiceExt};
+
+const HTTP_RESPONSE_MAGIC: &[u8; 4] = b"HTP1";
+
+/// Defines how a Tower request maps to a cache key and how responses are
+/// encoded into raw bytes.
+pub trait TowerCachePolicy<Request, Response>: Clone + Send + Sync + 'static {
+    /// Returns a cache key for the request. Returning `None` bypasses the
+    /// middleware for that request.
+    fn cache_key(&self, request: &Request) -> Option<String>;
+
+    /// Encodes the response into raw bytes before storing it.
+    fn encode_response(&self, response: &Response) -> Result<Vec<u8>>;
+
+    /// Decodes raw cached bytes back into a response.
+    fn decode_response(&self, bytes: &[u8]) -> Result<Response>;
+}
+
+/// Helper policy for services that already return `Vec<u8>`.
+#[derive(Clone)]
+pub struct BytesPolicy<F> {
+    key_fn: F,
+}
+
+impl<F> BytesPolicy<F> {
+    /// Creates a policy that uses `key_fn` to derive the cache key.
+    pub fn new(key_fn: F) -> Self {
+        Self { key_fn }
+    }
+}
+
+impl<Request, F> TowerCachePolicy<Request, Vec<u8>> for BytesPolicy<F>
+where
+    F: Fn(&Request) -> String + Clone + Send + Sync + 'static,
+{
+    fn cache_key(&self, request: &Request) -> Option<String> {
+        Some((self.key_fn)(request))
+    }
+
+    fn encode_response(&self, response: &Vec<u8>) -> Result<Vec<u8>> {
+        Ok(response.clone())
+    }
+
+    fn decode_response(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(bytes.to_vec())
+    }
+}
+
+/// Tower layer that caches and deduplicates requests through [`SingleFlight`].
+#[derive(Clone)]
+pub struct SingleFlightLayer<C, P, M = crate::NoopMetrics> {
+    singleflight: SingleFlight<C, M>,
+    policy: P,
+}
+
+impl<C, P, M> SingleFlightLayer<C, P, M>
+where
+    C: CacheBackend,
+    M: MetricsHooks,
+    P: Clone,
+{
+    /// Creates a new layer from an existing singleflight engine and request
+    /// policy.
+    pub fn new(singleflight: SingleFlight<C, M>, policy: P) -> Self {
+        Self {
+            singleflight,
+            policy,
+        }
+    }
+}
+
+impl<S, C, P, M> Layer<S> for SingleFlightLayer<C, P, M>
+where
+    C: CacheBackend,
+    M: MetricsHooks,
+    P: Clone,
+{
+    type Service = SingleFlightService<S, C, P, M>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        SingleFlightService {
+            inner,
+            singleflight: self.singleflight.clone(),
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+/// Tower service produced by [`SingleFlightLayer`].
+#[derive(Clone)]
+pub struct SingleFlightService<S, C, P, M = crate::NoopMetrics> {
+    inner: S,
+    singleflight: SingleFlight<C, M>,
+    policy: P,
+}
+
+impl<S, Request, Response, C, P, M> Service<Request> for SingleFlightService<S, C, P, M>
+where
+    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: StdError + Send + Sync + 'static,
+    Request: Clone + Send + 'static,
+    Response: Send + 'static,
+    C: CacheBackend,
+    M: MetricsHooks,
+    P: TowerCachePolicy<Request, Response>,
+{
+    type Response = Response;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Response>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let inner = self.inner.clone();
+        let singleflight = self.singleflight.clone();
+        let policy = self.policy.clone();
+
+        Box::pin(async move {
+            let Some(key) = policy.cache_key(&request) else {
+                return inner.oneshot(request).await.map_err(Error::operation);
+            };
+
+            let request_for_work = request.clone();
+            let inner_for_work = inner.clone();
+            let policy_for_work = policy.clone();
+            let cached: crate::LookupResult = singleflight
+                .get_or_compute(key, move || {
+                    let request = request_for_work.clone();
+                    let inner = inner_for_work.clone();
+                    let policy = policy_for_work.clone();
+
+                    async move {
+                        let response = inner.oneshot(request).await.map_err(Error::operation)?;
+                        policy.encode_response(&response)
+                    }
+                })
+                .await?;
+
+            policy.decode_response(cached.value())
+        })
+    }
+}
+
+/// Ergonomic HTTP-aware singleflight layer for Tower and Axum-style services.
+///
+/// This layer is meant for the common case where you want:
+/// - sensible HTTP defaults
+/// - minimal user code
+/// - request filtering, keying, per-request TTLs, and status filtering
+///
+/// Defaults:
+/// - only `GET` and `HEAD` are cached
+/// - only successful (`2xx`) responses are cached
+/// - keys use `METHOD:path?sorted=query`
+pub struct HttpSingleFlightLayer<C, ReqBody, M = crate::NoopMetrics> {
+    singleflight: SingleFlight<C, M>,
+    predicate: Arc<dyn Fn(&Request<ReqBody>) -> bool + Send + Sync>,
+    key_fn: Arc<dyn Fn(&Request<ReqBody>) -> String + Send + Sync>,
+    ttl_fn: Arc<dyn Fn(&Request<ReqBody>) -> Duration + Send + Sync>,
+    stale_while_revalidate: Option<Duration>,
+    cache_status: Arc<dyn Fn(StatusCode) -> bool + Send + Sync>,
+    _marker: PhantomData<fn(ReqBody)>,
+}
+
+impl<C, ReqBody, M> Clone for HttpSingleFlightLayer<C, ReqBody, M> {
+    fn clone(&self) -> Self {
+        Self {
+            singleflight: self.singleflight.clone(),
+            predicate: Arc::clone(&self.predicate),
+            key_fn: Arc::clone(&self.key_fn),
+            ttl_fn: Arc::clone(&self.ttl_fn),
+            stale_while_revalidate: self.stale_while_revalidate,
+            cache_status: Arc::clone(&self.cache_status),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<C, ReqBody> HttpSingleFlightLayer<C, ReqBody, crate::NoopMetrics>
+where
+    C: CacheBackend,
+    ReqBody: 'static,
+{
+    /// Creates an HTTP layer with safe defaults:
+    /// - `GET` and `HEAD` only
+    /// - `2xx` responses only
+    /// - normalized request keys
+    pub fn new(cache: C, ttl: Duration) -> Self {
+        Self::with_metrics(cache, ttl, crate::NoopMetrics)
+    }
+}
+
+impl<C, ReqBody, M> HttpSingleFlightLayer<C, ReqBody, M>
+where
+    C: CacheBackend,
+    M: MetricsHooks,
+    ReqBody: 'static,
+{
+    /// Creates an HTTP layer with custom metrics hooks.
+    pub fn with_metrics(cache: C, ttl: Duration, metrics: M) -> Self {
+        let policy = CachePolicy::new(ttl);
+
+        Self {
+            singleflight: SingleFlight::with_metrics(cache, policy, metrics),
+            predicate: Arc::new(default_request_predicate::<ReqBody>),
+            key_fn: Arc::new(default_cache_key::<ReqBody>),
+            ttl_fn: Arc::new(move |_| ttl),
+            stale_while_revalidate: None,
+            cache_status: Arc::new(|status: StatusCode| status.is_success()),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Serves stale responses immediately while a background refresh runs.
+    pub fn stale_while_revalidate(mut self, ttl: Duration) -> Self {
+        self.stale_while_revalidate = Some(ttl);
+        self
+    }
+
+    /// Controls which requests are eligible for singleflight and caching.
+    pub fn predicate<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(&Request<ReqBody>) -> bool + Send + Sync + 'static,
+    {
+        self.predicate = Arc::new(predicate);
+        self
+    }
+
+    /// Overrides the cache key derivation logic.
+    pub fn key_with<F>(mut self, key_fn: F) -> Self
+    where
+        F: Fn(&Request<ReqBody>) -> String + Send + Sync + 'static,
+    {
+        self.key_fn = Arc::new(key_fn);
+        self
+    }
+
+    /// Computes the fresh TTL per request while preserving the configured
+    /// stale-while-revalidate window.
+    pub fn ttl_with<F>(mut self, ttl_fn: F) -> Self
+    where
+        F: Fn(&Request<ReqBody>) -> Duration + Send + Sync + 'static,
+    {
+        self.ttl_fn = Arc::new(ttl_fn);
+        self
+    }
+
+    /// Controls which status codes are written to cache.
+    pub fn cache_status<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(StatusCode) -> bool + Send + Sync + 'static,
+    {
+        self.cache_status = Arc::new(predicate);
+        self
+    }
+}
+
+impl<S, C, ReqBody, M> Layer<S> for HttpSingleFlightLayer<C, ReqBody, M>
+where
+    C: CacheBackend,
+    M: MetricsHooks,
+{
+    type Service = HttpSingleFlightService<S, C, ReqBody, M>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        HttpSingleFlightService {
+            inner,
+            singleflight: self.singleflight.clone(),
+            predicate: Arc::clone(&self.predicate),
+            key_fn: Arc::clone(&self.key_fn),
+            ttl_fn: Arc::clone(&self.ttl_fn),
+            stale_while_revalidate: self.stale_while_revalidate,
+            cache_status: Arc::clone(&self.cache_status),
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Tower service produced by [`HttpSingleFlightLayer`].
+pub struct HttpSingleFlightService<S, C, ReqBody, M = crate::NoopMetrics> {
+    inner: S,
+    singleflight: SingleFlight<C, M>,
+    predicate: Arc<dyn Fn(&Request<ReqBody>) -> bool + Send + Sync>,
+    key_fn: Arc<dyn Fn(&Request<ReqBody>) -> String + Send + Sync>,
+    ttl_fn: Arc<dyn Fn(&Request<ReqBody>) -> Duration + Send + Sync>,
+    stale_while_revalidate: Option<Duration>,
+    cache_status: Arc<dyn Fn(StatusCode) -> bool + Send + Sync>,
+    _marker: PhantomData<fn(ReqBody)>,
+}
+
+impl<S, C, ReqBody, M> Clone for HttpSingleFlightService<S, C, ReqBody, M>
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            singleflight: self.singleflight.clone(),
+            predicate: Arc::clone(&self.predicate),
+            key_fn: Arc::clone(&self.key_fn),
+            ttl_fn: Arc::clone(&self.ttl_fn),
+            stale_while_revalidate: self.stale_while_revalidate,
+            cache_status: Arc::clone(&self.cache_status),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S, C, ReqBody, ResBody, M> Service<Request<ReqBody>>
+    for HttpSingleFlightService<S, C, ReqBody, M>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: StdError + Send + Sync + 'static,
+    C: CacheBackend,
+    M: MetricsHooks,
+    ReqBody: Send + 'static,
+    ResBody: HttpBody<Data = Bytes> + Send + 'static,
+    ResBody::Error: StdError + Send + Sync + 'static,
+{
+    type Response = Response<Full<Bytes>>;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
+        let inner = self.inner.clone();
+        let singleflight = self.singleflight.clone();
+        let predicate = Arc::clone(&self.predicate);
+        let key_fn = Arc::clone(&self.key_fn);
+        let ttl_fn = Arc::clone(&self.ttl_fn);
+        let cache_status = Arc::clone(&self.cache_status);
+        let stale_while_revalidate = self.stale_while_revalidate;
+
+        Box::pin(async move {
+            if !(predicate)(&request) {
+                let response = inner.oneshot(request).await.map_err(Error::operation)?;
+                return buffer_http_response(response).await;
+            }
+
+            let key = (key_fn)(&request);
+            let fresh_ttl = (ttl_fn)(&request);
+            let request_policy = with_optional_stale(fresh_ttl, stale_while_revalidate);
+            let request_slot = Arc::new(Mutex::new(Some(request)));
+
+            let cached = singleflight
+                .get_or_compute_with(key, request_policy, {
+                    let request_slot = Arc::clone(&request_slot);
+                    let inner = inner.clone();
+                    let cache_status = Arc::clone(&cache_status);
+
+                    move || {
+                        let request_slot = Arc::clone(&request_slot);
+                        let inner = inner.clone();
+                        let cache_status = Arc::clone(&cache_status);
+
+                        async move {
+                            let request = request_slot.lock().await.take().ok_or_else(|| {
+                                Error::internal(
+                                    "the HTTP middleware request was consumed more than once",
+                                )
+                            })?;
+
+                            let response =
+                                inner.oneshot(request).await.map_err(Error::operation)?;
+                            let (encoded, status) = encode_http_response(response).await?;
+
+                            if (cache_status)(status) {
+                                Ok(ComputeValue::cache_with_policy(encoded, request_policy))
+                            } else {
+                                Ok(ComputeValue::do_not_cache(encoded))
+                            }
+                        }
+                    }
+                })
+                .await?;
+
+            decode_http_response(cached.value())
+        })
+    }
+}
+
+fn with_optional_stale(
+    fresh_ttl: Duration,
+    stale_while_revalidate: Option<Duration>,
+) -> CachePolicy {
+    match stale_while_revalidate {
+        Some(stale) => CachePolicy::new(fresh_ttl).with_stale_while_revalidate(stale),
+        None => CachePolicy::new(fresh_ttl),
+    }
+}
+
+fn default_request_predicate<ReqBody>(request: &Request<ReqBody>) -> bool {
+    matches!(*request.method(), Method::GET | Method::HEAD)
+}
+
+fn default_cache_key<ReqBody>(request: &Request<ReqBody>) -> String {
+    let mut key = format!("{}:{}", request.method(), request.uri().path());
+
+    if let Some(query) = request.uri().query() {
+        let normalized = normalize_query(query);
+
+        if !normalized.is_empty() {
+            key.push('?');
+            key.push_str(&normalized);
+        }
+    }
+
+    key
+}
+
+fn normalize_query(query: &str) -> String {
+    let mut parts: Vec<&str> = query.split('&').filter(|part| !part.is_empty()).collect();
+    parts.sort_unstable();
+    parts.join("&")
+}
+
+async fn buffer_http_response<ResBody>(response: Response<ResBody>) -> Result<Response<Full<Bytes>>>
+where
+    ResBody: HttpBody<Data = Bytes> + Send + 'static,
+    ResBody::Error: StdError + Send + Sync + 'static,
+{
+    let (encoded, _) = encode_http_response(response).await?;
+    decode_http_response(&encoded)
+}
+
+async fn encode_http_response<ResBody>(response: Response<ResBody>) -> Result<(Vec<u8>, StatusCode)>
+where
+    ResBody: HttpBody<Data = Bytes> + Send + 'static,
+    ResBody::Error: StdError + Send + Sync + 'static,
+{
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let body = body.collect().await.map_err(Error::operation)?.to_bytes();
+    let mut bytes = Vec::new();
+
+    bytes.extend_from_slice(HTTP_RESPONSE_MAGIC);
+    bytes.push(encode_version(parts.version));
+    bytes.extend_from_slice(&parts.status.as_u16().to_be_bytes());
+    bytes.extend_from_slice(&(parts.headers.len() as u32).to_be_bytes());
+
+    for (name, value) in &parts.headers {
+        let name = name.as_str().as_bytes();
+        let value = value.as_bytes();
+
+        bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(value);
+    }
+
+    bytes.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&body);
+
+    Ok((bytes, status))
+}
+
+fn decode_http_response(bytes: &[u8]) -> Result<Response<Full<Bytes>>> {
+    if bytes.len() < 19 || &bytes[..4] != HTTP_RESPONSE_MAGIC {
+        return Err(Error::decode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid cached HTTP response",
+        )));
+    }
+
+    let mut cursor = 4;
+    let version = decode_version(read_u8(bytes, &mut cursor)?)?;
+    let status = StatusCode::from_u16(read_u16(bytes, &mut cursor)?).map_err(Error::decode)?;
+    let header_count = read_u32(bytes, &mut cursor)? as usize;
+    let mut response = Response::builder().status(status).version(version);
+
+    for _ in 0..header_count {
+        let name_len = read_u16(bytes, &mut cursor)? as usize;
+        let name = read_exact(bytes, &mut cursor, name_len)?;
+        let value_len = read_u32(bytes, &mut cursor)? as usize;
+        let value = read_exact(bytes, &mut cursor, value_len)?;
+
+        response = response.header(
+            http::header::HeaderName::from_bytes(name).map_err(Error::decode)?,
+            http::header::HeaderValue::from_bytes(value).map_err(Error::decode)?,
+        );
+    }
+
+    let body_len = read_u64(bytes, &mut cursor)? as usize;
+    let body = Bytes::copy_from_slice(read_exact(bytes, &mut cursor, body_len)?);
+
+    response
+        .body(Full::new(body))
+        .map_err(|error| Error::decode(std::io::Error::other(error.to_string())))
+}
+
+fn encode_version(version: Version) -> u8 {
+    match version {
+        Version::HTTP_09 => 0,
+        Version::HTTP_10 => 1,
+        Version::HTTP_11 => 2,
+        Version::HTTP_2 => 3,
+        Version::HTTP_3 => 4,
+        _ => 2,
+    }
+}
+
+fn decode_version(value: u8) -> Result<Version> {
+    match value {
+        0 => Ok(Version::HTTP_09),
+        1 => Ok(Version::HTTP_10),
+        2 => Ok(Version::HTTP_11),
+        3 => Ok(Version::HTTP_2),
+        4 => Ok(Version::HTTP_3),
+        _ => Err(Error::decode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported cached HTTP version",
+        ))),
+    }
+}
+
+fn read_exact<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = cursor.saturating_add(len);
+
+    if end > bytes.len() {
+        return Err(Error::decode(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "cached HTTP response ended unexpectedly",
+        )));
+    }
+
+    let slice = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(slice)
+}
+
+fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8> {
+    Ok(read_exact(bytes, cursor, 1)?[0])
+}
+
+fn read_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16> {
+    let value = read_exact(bytes, cursor, 2)?;
+    Ok(u16::from_be_bytes([value[0], value[1]]))
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let value = read_exact(bytes, cursor, 4)?;
+    Ok(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
+    let value = read_exact(bytes, cursor, 8)?;
+    Ok(u64::from_be_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
+}
