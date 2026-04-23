@@ -26,6 +26,34 @@ async fn response_body(response: Response<Full<Bytes>>) -> Bytes {
 }
 
 #[tokio::test]
+async fn http_layer_turns_internal_failures_into_http_500_by_default() {
+    let cache = MemoryCache::default();
+
+    let service = HttpSingleFlightLayer::new(cache, Duration::from_secs(1)).layer(service_fn(
+        |_request: Request<()>| async move {
+            Err::<Response<Full<Bytes>>, _>(io::Error::other("origin exploded"))
+        },
+    ));
+
+    let response = service
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/users")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("HTTP layer should be infallible");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response_body(response).await,
+        Bytes::from("singleflight middleware error")
+    );
+}
+
+#[tokio::test]
 async fn http_layer_defaults_to_safe_methods_and_success_statuses() {
     let cache = MemoryCache::default();
     let calls = Arc::new(AtomicUsize::new(0));

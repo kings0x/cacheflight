@@ -4,6 +4,7 @@ use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body as HttpBody;
 use http_body_util::{BodyExt, Full};
 use std::{
+    convert::Infallible,
     error::Error as StdError,
     future::Future,
     marker::PhantomData,
@@ -177,6 +178,7 @@ pub struct HttpSingleFlightLayer<C, ReqBody, M = crate::NoopMetrics> {
     ttl_fn: Arc<dyn Fn(&Request<ReqBody>) -> Duration + Send + Sync>,
     stale_while_revalidate: Option<Duration>,
     cache_status: Arc<dyn Fn(StatusCode) -> bool + Send + Sync>,
+    error_handler: Arc<dyn Fn(Error) -> Response<Full<Bytes>> + Send + Sync>,
     _marker: PhantomData<fn(ReqBody)>,
 }
 
@@ -189,6 +191,7 @@ impl<C, ReqBody, M> Clone for HttpSingleFlightLayer<C, ReqBody, M> {
             ttl_fn: Arc::clone(&self.ttl_fn),
             stale_while_revalidate: self.stale_while_revalidate,
             cache_status: Arc::clone(&self.cache_status),
+            error_handler: Arc::clone(&self.error_handler),
             _marker: PhantomData,
         }
     }
@@ -225,6 +228,7 @@ where
             ttl_fn: Arc::new(move |_| ttl),
             stale_while_revalidate: None,
             cache_status: Arc::new(|status: StatusCode| status.is_success()),
+            error_handler: Arc::new(default_http_error_response),
             _marker: PhantomData,
         }
     }
@@ -271,6 +275,17 @@ where
         self.cache_status = Arc::new(predicate);
         self
     }
+
+    /// Overrides how internal middleware errors are converted into HTTP
+    /// responses. By default the layer returns a `500 Internal Server Error`
+    /// with a short plain-text body.
+    pub fn error_response_with<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(Error) -> Response<Full<Bytes>> + Send + Sync + 'static,
+    {
+        self.error_handler = Arc::new(handler);
+        self
+    }
 }
 
 impl<S, C, ReqBody, M> Layer<S> for HttpSingleFlightLayer<C, ReqBody, M>
@@ -289,6 +304,7 @@ where
             ttl_fn: Arc::clone(&self.ttl_fn),
             stale_while_revalidate: self.stale_while_revalidate,
             cache_status: Arc::clone(&self.cache_status),
+            error_handler: Arc::clone(&self.error_handler),
             _marker: PhantomData,
         }
     }
@@ -303,6 +319,7 @@ pub struct HttpSingleFlightService<S, C, ReqBody, M = crate::NoopMetrics> {
     ttl_fn: Arc<dyn Fn(&Request<ReqBody>) -> Duration + Send + Sync>,
     stale_while_revalidate: Option<Duration>,
     cache_status: Arc<dyn Fn(StatusCode) -> bool + Send + Sync>,
+    error_handler: Arc<dyn Fn(Error) -> Response<Full<Bytes>> + Send + Sync>,
     _marker: PhantomData<fn(ReqBody)>,
 }
 
@@ -319,6 +336,7 @@ where
             ttl_fn: Arc::clone(&self.ttl_fn),
             stale_while_revalidate: self.stale_while_revalidate,
             cache_status: Arc::clone(&self.cache_status),
+            error_handler: Arc::clone(&self.error_handler),
             _marker: PhantomData,
         }
     }
@@ -337,8 +355,9 @@ where
     ResBody::Error: StdError + Send + Sync + 'static,
 {
     type Response = Response<Full<Bytes>>;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send>>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -351,52 +370,61 @@ where
         let key_fn = Arc::clone(&self.key_fn);
         let ttl_fn = Arc::clone(&self.ttl_fn);
         let cache_status = Arc::clone(&self.cache_status);
+        let error_handler = Arc::clone(&self.error_handler);
         let stale_while_revalidate = self.stale_while_revalidate;
 
         Box::pin(async move {
-            if !(predicate)(&request) {
-                let response = inner.oneshot(request).await.map_err(Error::operation)?;
-                return buffer_http_response(response).await;
-            }
+            let response = async {
+                if !(predicate)(&request) {
+                    let response = inner.oneshot(request).await.map_err(Error::operation)?;
+                    return buffer_http_response(response).await;
+                }
 
-            let key = (key_fn)(&request);
-            let fresh_ttl = (ttl_fn)(&request);
-            let request_policy = with_optional_stale(fresh_ttl, stale_while_revalidate);
-            let request_slot = Arc::new(Mutex::new(Some(request)));
+                let key = (key_fn)(&request);
+                let fresh_ttl = (ttl_fn)(&request);
+                let request_policy = with_optional_stale(fresh_ttl, stale_while_revalidate);
+                let request_slot = Arc::new(Mutex::new(Some(request)));
 
-            let cached = singleflight
-                .get_or_compute_with(key, request_policy, {
-                    let request_slot = Arc::clone(&request_slot);
-                    let inner = inner.clone();
-                    let cache_status = Arc::clone(&cache_status);
-
-                    move || {
+                let cached = singleflight
+                    .get_or_compute_with(key, request_policy, {
                         let request_slot = Arc::clone(&request_slot);
                         let inner = inner.clone();
                         let cache_status = Arc::clone(&cache_status);
 
-                        async move {
-                            let request = request_slot.lock().await.take().ok_or_else(|| {
-                                Error::internal(
-                                    "the HTTP middleware request was consumed more than once",
-                                )
-                            })?;
+                        move || {
+                            let request_slot = Arc::clone(&request_slot);
+                            let inner = inner.clone();
+                            let cache_status = Arc::clone(&cache_status);
 
-                            let response =
-                                inner.oneshot(request).await.map_err(Error::operation)?;
-                            let (encoded, status) = encode_http_response(response).await?;
+                            async move {
+                                let request = request_slot.lock().await.take().ok_or_else(|| {
+                                    Error::internal(
+                                        "the HTTP middleware request was consumed more than once",
+                                    )
+                                })?;
 
-                            if (cache_status)(status) {
-                                Ok(ComputeValue::cache_with_policy(encoded, request_policy))
-                            } else {
-                                Ok(ComputeValue::do_not_cache(encoded))
+                                let response =
+                                    inner.oneshot(request).await.map_err(Error::operation)?;
+                                let (encoded, status) = encode_http_response(response).await?;
+
+                                if (cache_status)(status) {
+                                    Ok(ComputeValue::cache_with_policy(encoded, request_policy))
+                                } else {
+                                    Ok(ComputeValue::do_not_cache(encoded))
+                                }
                             }
                         }
-                    }
-                })
-                .await?;
+                    })
+                    .await?;
 
-            decode_http_response(cached.value())
+                decode_http_response(cached.value())
+            }
+            .await;
+
+            Ok(match response {
+                Ok(response) => response,
+                Err(error) => (error_handler)(error),
+            })
         })
     }
 }
@@ -434,6 +462,16 @@ fn normalize_query(query: &str) -> String {
     let mut parts: Vec<&str> = query.split('&').filter(|part| !part.is_empty()).collect();
     parts.sort_unstable();
     parts.join("&")
+}
+
+fn default_http_error_response(_error: Error) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from_static(
+            b"singleflight middleware error",
+        )))
+        .expect("default HTTP error response should build")
 }
 
 async fn buffer_http_response<ResBody>(response: Response<ResBody>) -> Result<Response<Full<Bytes>>>

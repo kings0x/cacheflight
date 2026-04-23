@@ -88,9 +88,21 @@ async fn main() -> Result<()> {
             .expect("request should build")
     };
 
-    let one = service.clone().oneshot(request()).await?;
-    let two = service.clone().oneshot(request()).await?;
-    let three = service.clone().oneshot(request()).await?;
+    let one = service
+        .clone()
+        .oneshot(request())
+        .await
+        .expect("request should succeed");
+    let two = service
+        .clone()
+        .oneshot(request())
+        .await
+        .expect("request should succeed");
+    let three = service
+        .clone()
+        .oneshot(request())
+        .await
+        .expect("request should succeed");
 
     println!("response one: {}", body_text(one).await);
     println!("response two: {}", body_text(two).await);

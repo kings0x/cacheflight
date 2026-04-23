@@ -3,7 +3,6 @@ mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
-    error_handling::HandleErrorLayer,
     extract::Path,
     http::{Request, StatusCode},
     response::IntoResponse,
@@ -19,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::sleep;
-use tower::{ServiceBuilder, ServiceExt};
+use tower::ServiceExt;
 
 // Run with:
 // cargo run --example axum_router
@@ -65,18 +64,7 @@ async fn main() -> Result<()> {
                 }
             }),
         )
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(
-                    |error: singleflight_rs::Error| async move {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("singleflight middleware error: {error}"),
-                        )
-                    },
-                ))
-                .layer(layer),
-        );
+        .layer(layer);
 
     let request = || {
         Request::builder()
@@ -89,17 +77,17 @@ async fn main() -> Result<()> {
         .clone()
         .oneshot(request())
         .await
-        .map_err(singleflight_rs::Error::operation)?;
+        .expect("request should succeed");
     let second = app
         .clone()
         .oneshot(request())
         .await
-        .map_err(singleflight_rs::Error::operation)?;
+        .expect("request should succeed");
     let third = app
         .clone()
         .oneshot(request())
         .await
-        .map_err(singleflight_rs::Error::operation)?;
+        .expect("request should succeed");
 
     println!(
         "response one: {}",
@@ -123,11 +111,7 @@ async fn main() -> Result<()> {
     println!("let layer = HttpSingleFlightLayer::new(cache, ttl)");
     println!("    .stale_while_revalidate(stale_ttl)");
     println!("    .predicate(|req| ...);");
-    println!("let app = Router::new().route(...).layer(");
-    println!("    ServiceBuilder::new()");
-    println!("        .layer(HandleErrorLayer::new(...))");
-    println!("        .layer(layer)");
-    println!(");");
+    println!("let app = Router::new().route(...).layer(layer);");
 
     Ok(())
 }
