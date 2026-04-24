@@ -3,7 +3,7 @@ mod support;
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use singleflight_rs::HttpSingleFlightLayer;
+use singleflight::HttpSingleFlightLayer;
 use std::{
     io,
     sync::{

@@ -1,6 +1,6 @@
 mod support;
 
-use singleflight_rs::{
+use singleflight::{
     BytesPolicy, CachePolicy, Error, Result, SingleFlight, SingleFlightLayer, TowerCachePolicy,
 };
 use std::{

@@ -1,6 +1,6 @@
 mod support;
 
-use singleflight_rs::{
+use singleflight::{
     CacheMissReason, CachePolicy, Error, LookupState, RecomputeOutcome, RecomputeReason,
     SingleFlight,
 };

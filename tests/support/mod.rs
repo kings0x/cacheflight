@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use singleflight_rs::{
+use singleflight::{
     CacheBackend, CacheMissReason, Error, MetricsHooks, RecomputeOutcome, RecomputeReason, Result,
     async_trait,
 };

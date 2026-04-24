@@ -1,4 +1,4 @@
-use singleflight_rs::{CacheBackend, Result, async_trait};
+use singleflight::{CacheBackend, Result, async_trait};
 use std::{
     collections::HashMap,
     sync::Arc,

@@ -1,7 +1,7 @@
 mod common;
 
 use common::MemoryCache;
-use singleflight_rs::{
+use singleflight::{
     CacheMissReason, CachePolicy, LookupState, MetricsHooks, RecomputeOutcome, RecomputeReason,
     Result, SingleFlight,
 };

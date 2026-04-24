@@ -9,7 +9,7 @@ use axum::{
     routing::get,
 };
 use common::MemoryCache;
-use singleflight_rs::{HttpSingleFlightLayer, Result};
+use singleflight::{HttpSingleFlightLayer, Result};
 use std::{
     sync::{
         Arc,

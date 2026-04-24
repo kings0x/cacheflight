@@ -1,7 +1,7 @@
 mod common;
 
 use common::MemoryCache;
-use singleflight_rs::{CachePolicy, LookupState, Result, SingleFlight};
+use singleflight::{CachePolicy, LookupState, Result, SingleFlight};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

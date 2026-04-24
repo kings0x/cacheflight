@@ -1,4 +1,4 @@
-//! `singleflight-rs` deduplicates concurrent work for the same cache key while
+//! `singleflight` deduplicates concurrent work for the same cache key while
 //! remaining agnostic about the cache backend and payload serialization.
 //!
 //! The crate operates on raw `Vec<u8>` payloads. You serialize before entering
@@ -18,7 +18,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use singleflight_rs::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
+//! use singleflight::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
 //! use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 //! use tokio::sync::Mutex;
 //!

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use common::MemoryCache;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use singleflight_rs::{HttpSingleFlightLayer, Result};
+use singleflight::{HttpSingleFlightLayer, Result};
 use std::{
     sync::{
         Arc,
