@@ -354,6 +354,31 @@ async fn ignores_invalid_cached_entries_and_records_the_miss_reason() {
 }
 
 #[tokio::test]
+async fn cache_read_failures_are_reported_and_recomputed() {
+    let cache = MemoryCache::default();
+    cache.fail_one_get();
+
+    let metrics = TestMetrics::default();
+    let singleflight = SingleFlight::with_metrics(
+        cache,
+        CachePolicy::new(Duration::from_millis(250)),
+        metrics.clone(),
+    );
+
+    let value = singleflight
+        .get_or_compute("read-error", || async { Ok(b"recovered".to_vec()) })
+        .await
+        .expect("cache read failures should fall back to recompute");
+
+    assert_eq!(value.state(), LookupState::Recomputed);
+    assert_eq!(value.value(), b"recovered");
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.cache_read_failures, 1);
+    assert!(snapshot.misses.contains(&CacheMissReason::BackendError));
+}
+
+#[tokio::test]
 async fn cache_write_failures_are_reported_without_failing_the_request() {
     let cache = MemoryCache::default();
     cache.fail_one_set();

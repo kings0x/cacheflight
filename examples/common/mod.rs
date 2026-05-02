@@ -29,16 +29,16 @@ impl MemoryCache {
 
 #[async_trait]
 impl CacheBackend for MemoryCache {
-    async fn get(&self, key: &str) -> Option<Vec<u8>> {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let mut guard = self.inner.lock().await;
 
         match guard.get(key) {
-            Some(entry) if entry.expires_at > Instant::now() => Some(entry.value.clone()),
+            Some(entry) if entry.expires_at > Instant::now() => Ok(Some(entry.value.clone())),
             Some(_) => {
                 guard.remove(key);
-                None
+                Ok(None)
             }
-            None => None,
+            None => Ok(None),
         }
     }
 

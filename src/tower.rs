@@ -1,11 +1,18 @@
 use crate::{CacheBackend, CachePolicy, ComputeValue, Error, MetricsHooks, Result, SingleFlight};
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode, Version};
+use http::{
+    Method, Request, Response, StatusCode, Version,
+    header::{
+        ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST,
+        HeaderName, HeaderValue, PROXY_AUTHORIZATION, RANGE,
+    },
+};
 use http_body::Body as HttpBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use std::{
     convert::Infallible,
     error::Error as StdError,
+    fmt::Write as _,
     future::Future,
     marker::PhantomData,
     pin::Pin,
@@ -17,6 +24,13 @@ use tokio::sync::Mutex;
 use tower::{Layer, Service, ServiceExt};
 
 const HTTP_RESPONSE_MAGIC: &[u8; 4] = b"HTP1";
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+type RequestPredicate<ReqBody> = Arc<dyn Fn(&Request<ReqBody>) -> bool + Send + Sync>;
+type RequestKeyFn<ReqBody> = Arc<dyn Fn(&Request<ReqBody>) -> String + Send + Sync>;
+type RequestTtlFn<ReqBody> = Arc<dyn Fn(&Request<ReqBody>) -> Duration + Send + Sync>;
+type StatusPredicate = Arc<dyn Fn(StatusCode) -> bool + Send + Sync>;
+type ErrorHandler = Arc<dyn Fn(Error) -> Response<Full<Bytes>> + Send + Sync>;
 
 /// Defines how a Tower request maps to a cache key and how responses are
 /// encoded into raw bytes.
@@ -169,16 +183,20 @@ where
 ///
 /// Defaults:
 /// - only `GET` and `HEAD` are cached
+/// - requests carrying `Authorization`, `Proxy-Authorization`, `Cookie`, or
+///   `Range` headers are bypassed
 /// - only successful (`2xx`) responses are cached
-/// - keys use `METHOD:path?sorted=query`
+/// - keys use `METHOD + host + path + sorted query + common content-negotiation headers`
+/// - response bodies are buffered up to 1 MiB before being cached or replayed
 pub struct HttpSingleFlightLayer<C, ReqBody, M = crate::NoopMetrics> {
     singleflight: SingleFlight<C, M>,
-    predicate: Arc<dyn Fn(&Request<ReqBody>) -> bool + Send + Sync>,
-    key_fn: Arc<dyn Fn(&Request<ReqBody>) -> String + Send + Sync>,
-    ttl_fn: Arc<dyn Fn(&Request<ReqBody>) -> Duration + Send + Sync>,
+    predicate: RequestPredicate<ReqBody>,
+    key_fn: RequestKeyFn<ReqBody>,
+    ttl_fn: RequestTtlFn<ReqBody>,
     stale_while_revalidate: Option<Duration>,
-    cache_status: Arc<dyn Fn(StatusCode) -> bool + Send + Sync>,
-    error_handler: Arc<dyn Fn(Error) -> Response<Full<Bytes>> + Send + Sync>,
+    cache_status: StatusPredicate,
+    max_response_bytes: usize,
+    error_handler: ErrorHandler,
     _marker: PhantomData<fn(ReqBody)>,
 }
 
@@ -191,6 +209,7 @@ impl<C, ReqBody, M> Clone for HttpSingleFlightLayer<C, ReqBody, M> {
             ttl_fn: Arc::clone(&self.ttl_fn),
             stale_while_revalidate: self.stale_while_revalidate,
             cache_status: Arc::clone(&self.cache_status),
+            max_response_bytes: self.max_response_bytes,
             error_handler: Arc::clone(&self.error_handler),
             _marker: PhantomData,
         }
@@ -204,8 +223,10 @@ where
 {
     /// Creates an HTTP layer with safe defaults:
     /// - `GET` and `HEAD` only
+    /// - authenticated, cookie-bearing, and range requests bypass caching
     /// - `2xx` responses only
-    /// - normalized request keys
+    /// - host-aware, query-normalized request keys with common `Accept*` variance
+    /// - response bodies buffered up to 1 MiB
     pub fn new(cache: C, ttl: Duration) -> Self {
         Self::with_metrics(cache, ttl, crate::NoopMetrics)
     }
@@ -228,6 +249,7 @@ where
             ttl_fn: Arc::new(move |_| ttl),
             stale_while_revalidate: None,
             cache_status: Arc::new(|status: StatusCode| status.is_success()),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             error_handler: Arc::new(default_http_error_response),
             _marker: PhantomData,
         }
@@ -276,6 +298,17 @@ where
         self
     }
 
+    /// Sets the maximum response body size the middleware will buffer.
+    ///
+    /// The HTTP middleware always collects the full body in order to replay it
+    /// from cache, so this limit protects the process from unbounded buffering.
+    /// Responses larger than the limit are converted into the configured error
+    /// response and are not cached.
+    pub fn max_response_bytes(mut self, max: usize) -> Self {
+        self.max_response_bytes = max;
+        self
+    }
+
     /// Overrides how internal middleware errors are converted into HTTP
     /// responses. By default the layer returns a `500 Internal Server Error`
     /// with a short plain-text body.
@@ -304,6 +337,7 @@ where
             ttl_fn: Arc::clone(&self.ttl_fn),
             stale_while_revalidate: self.stale_while_revalidate,
             cache_status: Arc::clone(&self.cache_status),
+            max_response_bytes: self.max_response_bytes,
             error_handler: Arc::clone(&self.error_handler),
             _marker: PhantomData,
         }
@@ -314,12 +348,13 @@ where
 pub struct HttpSingleFlightService<S, C, ReqBody, M = crate::NoopMetrics> {
     inner: S,
     singleflight: SingleFlight<C, M>,
-    predicate: Arc<dyn Fn(&Request<ReqBody>) -> bool + Send + Sync>,
-    key_fn: Arc<dyn Fn(&Request<ReqBody>) -> String + Send + Sync>,
-    ttl_fn: Arc<dyn Fn(&Request<ReqBody>) -> Duration + Send + Sync>,
+    predicate: RequestPredicate<ReqBody>,
+    key_fn: RequestKeyFn<ReqBody>,
+    ttl_fn: RequestTtlFn<ReqBody>,
     stale_while_revalidate: Option<Duration>,
-    cache_status: Arc<dyn Fn(StatusCode) -> bool + Send + Sync>,
-    error_handler: Arc<dyn Fn(Error) -> Response<Full<Bytes>> + Send + Sync>,
+    cache_status: StatusPredicate,
+    max_response_bytes: usize,
+    error_handler: ErrorHandler,
     _marker: PhantomData<fn(ReqBody)>,
 }
 
@@ -336,6 +371,7 @@ where
             ttl_fn: Arc::clone(&self.ttl_fn),
             stale_while_revalidate: self.stale_while_revalidate,
             cache_status: Arc::clone(&self.cache_status),
+            max_response_bytes: self.max_response_bytes,
             error_handler: Arc::clone(&self.error_handler),
             _marker: PhantomData,
         }
@@ -370,6 +406,7 @@ where
         let key_fn = Arc::clone(&self.key_fn);
         let ttl_fn = Arc::clone(&self.ttl_fn);
         let cache_status = Arc::clone(&self.cache_status);
+        let max_response_bytes = self.max_response_bytes;
         let error_handler = Arc::clone(&self.error_handler);
         let stale_while_revalidate = self.stale_while_revalidate;
 
@@ -377,7 +414,7 @@ where
             let response = async {
                 if !(predicate)(&request) {
                     let response = inner.oneshot(request).await.map_err(Error::operation)?;
-                    return buffer_http_response(response).await;
+                    return buffer_http_response(response, max_response_bytes).await;
                 }
 
                 let key = (key_fn)(&request);
@@ -405,7 +442,8 @@ where
 
                                 let response =
                                     inner.oneshot(request).await.map_err(Error::operation)?;
-                                let (encoded, status) = encode_http_response(response).await?;
+                                let (encoded, status) =
+                                    encode_http_response(response, max_response_bytes).await?;
 
                                 if (cache_status)(status) {
                                     Ok(ComputeValue::cache_with_policy(encoded, request_policy))
@@ -441,19 +479,51 @@ fn with_optional_stale(
 
 fn default_request_predicate<ReqBody>(request: &Request<ReqBody>) -> bool {
     matches!(*request.method(), Method::GET | Method::HEAD)
+        && !request.headers().contains_key(AUTHORIZATION)
+        && !request.headers().contains_key(PROXY_AUTHORIZATION)
+        && !request.headers().contains_key(COOKIE)
+        && !request.headers().contains_key(RANGE)
 }
 
 fn default_cache_key<ReqBody>(request: &Request<ReqBody>) -> String {
-    let mut key = format!("{}:{}", request.method(), request.uri().path());
+    let mut key = String::new();
+    write!(&mut key, "method={}|", request.method()).expect("writing to string should not fail");
+
+    if let Some(host) = request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| header_value_to_str(request.headers().get(HOST)))
+    {
+        key.push_str("host=");
+        key.push_str(host);
+        key.push('|');
+    }
+
+    key.push_str("path=");
+    key.push_str(request.uri().path());
 
     if let Some(query) = request.uri().query() {
         let normalized = normalize_query(query);
 
         if !normalized.is_empty() {
-            key.push('?');
+            key.push('|');
+            key.push_str("query=");
             key.push_str(&normalized);
         }
     }
+
+    append_header_key(&mut key, ACCEPT, request.headers().get(ACCEPT));
+    append_header_key(
+        &mut key,
+        ACCEPT_ENCODING,
+        request.headers().get(ACCEPT_ENCODING),
+    );
+    append_header_key(
+        &mut key,
+        ACCEPT_LANGUAGE,
+        request.headers().get(ACCEPT_LANGUAGE),
+    );
 
     key
 }
@@ -467,48 +537,82 @@ fn normalize_query(query: &str) -> String {
 fn default_http_error_response(_error: Error) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from_static(
             b"singleflight middleware error",
         )))
         .expect("default HTTP error response should build")
 }
 
-async fn buffer_http_response<ResBody>(response: Response<ResBody>) -> Result<Response<Full<Bytes>>>
+async fn buffer_http_response<ResBody>(
+    response: Response<ResBody>,
+    max_response_bytes: usize,
+) -> Result<Response<Full<Bytes>>>
 where
     ResBody: HttpBody<Data = Bytes> + Send + 'static,
     ResBody::Error: StdError + Send + Sync + 'static,
 {
-    let (encoded, _) = encode_http_response(response).await?;
+    let (encoded, _) = encode_http_response(response, max_response_bytes).await?;
     decode_http_response(&encoded)
 }
 
-async fn encode_http_response<ResBody>(response: Response<ResBody>) -> Result<(Vec<u8>, StatusCode)>
+async fn encode_http_response<ResBody>(
+    response: Response<ResBody>,
+    max_response_bytes: usize,
+) -> Result<(Vec<u8>, StatusCode)>
 where
     ResBody: HttpBody<Data = Bytes> + Send + 'static,
     ResBody::Error: StdError + Send + Sync + 'static,
 {
     let (parts, body) = response.into_parts();
     let status = parts.status;
-    let body = body.collect().await.map_err(Error::operation)?.to_bytes();
+    let body = Limited::new(body, max_response_bytes)
+        .collect()
+        .await
+        .map_err(|error| Error::encode(std::io::Error::other(error.to_string())))?
+        .to_bytes();
     let mut bytes = Vec::new();
 
     bytes.extend_from_slice(HTTP_RESPONSE_MAGIC);
-    bytes.push(encode_version(parts.version));
+    bytes.push(encode_version(parts.version)?);
     bytes.extend_from_slice(&parts.status.as_u16().to_be_bytes());
-    bytes.extend_from_slice(&(parts.headers.len() as u32).to_be_bytes());
+    let header_count = u32::try_from(parts.headers.len()).map_err(|_| {
+        Error::encode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "too many HTTP headers to encode",
+        ))
+    })?;
+    bytes.extend_from_slice(&header_count.to_be_bytes());
 
     for (name, value) in &parts.headers {
         let name = name.as_str().as_bytes();
         let value = value.as_bytes();
+        let name_len = u16::try_from(name.len()).map_err(|_| {
+            Error::encode(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP header name is too long to encode",
+            ))
+        })?;
+        let value_len = u32::try_from(value.len()).map_err(|_| {
+            Error::encode(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP header value is too long to encode",
+            ))
+        })?;
 
-        bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&name_len.to_be_bytes());
         bytes.extend_from_slice(name);
-        bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&value_len.to_be_bytes());
         bytes.extend_from_slice(value);
     }
 
-    bytes.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    let body_len = u64::try_from(body.len()).map_err(|_| {
+        Error::encode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP body is too large to encode",
+        ))
+    })?;
+    bytes.extend_from_slice(&body_len.to_be_bytes());
     bytes.extend_from_slice(&body);
 
     Ok((bytes, status))
@@ -548,14 +652,33 @@ fn decode_http_response(bytes: &[u8]) -> Result<Response<Full<Bytes>>> {
         .map_err(|error| Error::decode(std::io::Error::other(error.to_string())))
 }
 
-fn encode_version(version: Version) -> u8 {
+fn encode_version(version: Version) -> Result<u8> {
     match version {
-        Version::HTTP_09 => 0,
-        Version::HTTP_10 => 1,
-        Version::HTTP_11 => 2,
-        Version::HTTP_2 => 3,
-        Version::HTTP_3 => 4,
-        _ => 2,
+        Version::HTTP_09 => Ok(0),
+        Version::HTTP_10 => Ok(1),
+        Version::HTTP_11 => Ok(2),
+        Version::HTTP_2 => Ok(3),
+        Version::HTTP_3 => Ok(4),
+        _ => Err(Error::encode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported HTTP version",
+        ))),
+    }
+}
+
+fn header_value_to_str(value: Option<&HeaderValue>) -> Option<&str> {
+    value.and_then(|value| value.to_str().ok())
+}
+
+fn append_header_key(key: &mut String, name: HeaderName, value: Option<&HeaderValue>) {
+    if let Some(value) = value {
+        key.push('|');
+        key.push_str(name.as_str());
+        key.push('=');
+
+        for byte in value.as_bytes() {
+            write!(key, "{byte:02x}").expect("writing to string should not fail");
+        }
     }
 }
 

@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![warn(missing_docs, rust_2018_idioms)]
+
 //! `singleflight` deduplicates concurrent work for the same cache key while
 //! remaining agnostic about the cache backend and payload serialization.
 //!
@@ -15,6 +18,17 @@
 //! - [`HttpSingleFlightLayer`] is the ergonomic HTTP middleware layer for
 //!   Tower and Axum-style services.
 //!
+//! # Production Notes
+//!
+//! - Cache backends can report read or write failures through [`Error`]. The
+//!   engine treats cache read failures as misses and recomputes instead.
+//! - The HTTP middleware is intentionally conservative: it bypasses requests
+//!   with common private/authenticated headers by default and buffers full
+//!   response bodies before replaying them from cache.
+//! - If your HTTP responses vary on request headers beyond the default
+//!   `Accept*` handling, provide a custom key with
+//!   [`HttpSingleFlightLayer::key_with`].
+//!
 //! # Example
 //!
 //! ```no_run
@@ -29,15 +43,15 @@
 //!
 //! #[async_trait]
 //! impl CacheBackend for MemoryCache {
-//!     async fn get(&self, key: &str) -> Option<Vec<u8>> {
+//!     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
 //!         let mut guard = self.inner.lock().await;
 //!         match guard.get(key) {
-//!             Some((value, expires_at)) if *expires_at > Instant::now() => Some(value.clone()),
+//!             Some((value, expires_at)) if *expires_at > Instant::now() => Ok(Some(value.clone())),
 //!             Some(_) => {
 //!                 guard.remove(key);
-//!                 None
+//!                 Ok(None)
 //!             }
-//!             None => None,
+//!             None => Ok(None),
 //!         }
 //!     }
 //!

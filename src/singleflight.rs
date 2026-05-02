@@ -77,10 +77,15 @@ impl ComputeValue {
 
 /// The path a lookup took through the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LookupState {
+    /// The returned bytes came directly from a fresh cache entry.
     CacheHit,
+    /// The caller received a stale value while a refresh ran in the background.
     Stale,
+    /// This caller executed the recomputation closure.
     Recomputed,
+    /// This caller waited for another in-flight recomputation to finish.
     Shared,
 }
 
@@ -226,8 +231,8 @@ where
     {
         let key = key.into();
 
-        if let Some(cached) = self.cache.get(&key).await {
-            match classify_cached_entry(&cached, now_millis()) {
+        match self.cache.get(&key).await {
+            Ok(Some(cached)) => match classify_cached_entry(&cached, now_millis()) {
                 CachedEntryState::Fresh(value) => {
                     self.metrics.on_cache_hit(&key);
                     return Ok(LookupResult::new(value.to_vec(), LookupState::CacheHit));
@@ -244,9 +249,15 @@ where
                 CachedEntryState::Invalid => {
                     self.metrics.on_cache_miss(&key, CacheMissReason::Invalid);
                 }
+            },
+            Ok(None) => {
+                self.metrics.on_cache_miss(&key, CacheMissReason::Missing);
             }
-        } else {
-            self.metrics.on_cache_miss(&key, CacheMissReason::Missing);
+            Err(error) => {
+                self.metrics.on_cache_read_failed(&key, &error);
+                self.metrics
+                    .on_cache_miss(&key, CacheMissReason::BackendError);
+            }
         }
 
         let (flight, joined_existing) = self.start_or_join_flight(&key).await;

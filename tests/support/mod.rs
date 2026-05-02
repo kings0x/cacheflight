@@ -18,6 +18,7 @@ use tokio::{sync::Mutex as AsyncMutex, time::sleep};
 #[derive(Clone, Default)]
 pub struct MemoryCache {
     entries: Arc<AsyncMutex<HashMap<String, CacheEntry>>>,
+    fail_next_get: Arc<AtomicUsize>,
     fail_next_set: Arc<AtomicUsize>,
 }
 
@@ -28,6 +29,10 @@ struct CacheEntry {
 }
 
 impl MemoryCache {
+    pub fn fail_one_get(&self) {
+        self.fail_next_get.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn fail_one_set(&self) {
         self.fail_next_set.fetch_add(1, Ordering::SeqCst);
     }
@@ -45,16 +50,29 @@ impl MemoryCache {
 
 #[async_trait]
 impl CacheBackend for MemoryCache {
-    async fn get(&self, key: &str) -> Option<Vec<u8>> {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let should_fail = self
+            .fail_next_get
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                (pending > 0).then(|| pending - 1)
+            })
+            .is_ok();
+
+        if should_fail {
+            return Err(Error::cache_read(io::Error::other(
+                "forced cache read failure",
+            )));
+        }
+
         let mut entries = self.entries.lock().await;
 
         match entries.get(key) {
-            Some(entry) if entry.expires_at > Instant::now() => Some(entry.value.clone()),
+            Some(entry) if entry.expires_at > Instant::now() => Ok(Some(entry.value.clone())),
             Some(_) => {
                 entries.remove(key);
-                None
+                Ok(None)
             }
-            None => None,
+            None => Ok(None),
         }
     }
 
@@ -92,6 +110,7 @@ pub struct TestMetrics {
 pub struct MetricsSnapshot {
     pub hits: usize,
     pub stale_hits: usize,
+    pub cache_read_failures: usize,
     pub cache_write_failures: usize,
     pub misses: Vec<CacheMissReason>,
     pub deduplicated: Vec<RecomputeReason>,
@@ -123,6 +142,13 @@ impl MetricsHooks for TestMetrics {
             .expect("metrics mutex poisoned")
             .misses
             .push(reason);
+    }
+
+    fn on_cache_read_failed(&self, _key: &str, _error: &Error) {
+        self.inner
+            .lock()
+            .expect("metrics mutex poisoned")
+            .cache_read_failures += 1;
     }
 
     fn on_deduplicated(&self, _key: &str, reason: RecomputeReason) {

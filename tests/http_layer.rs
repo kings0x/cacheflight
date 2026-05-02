@@ -1,10 +1,14 @@
 mod support;
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
+use http::{
+    Method, Request, Response, StatusCode,
+    header::{ACCEPT, AUTHORIZATION, COOKIE, HOST, RANGE},
+};
 use http_body_util::{BodyExt, Full};
 use singleflight::HttpSingleFlightLayer;
 use std::{
+    error::Error as _,
     io,
     sync::{
         Arc,
@@ -176,6 +180,122 @@ async fn http_layer_defaults_to_safe_methods_and_success_statuses() {
 }
 
 #[tokio::test]
+async fn http_layer_bypasses_private_and_range_requests_by_default() {
+    let cache = MemoryCache::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let service = HttpSingleFlightLayer::new(cache, Duration::from_secs(1)).layer(service_fn({
+        let calls = calls.clone();
+        move |request: Request<()>| {
+            let calls = calls.clone();
+            async move {
+                let current = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok::<_, io::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from(format!(
+                            "{}:{}:{current}",
+                            request.method(),
+                            request.uri().path()
+                        ))))
+                        .expect("response should build"),
+                )
+            }
+        }
+    }));
+
+    let auth_one = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/private")
+                .header(AUTHORIZATION, "Bearer token-a")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    let auth_two = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/private")
+                .header(AUTHORIZATION, "Bearer token-a")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response_body(auth_one).await, Bytes::from("GET:/private:1"));
+    assert_eq!(response_body(auth_two).await, Bytes::from("GET:/private:2"));
+
+    let cookie_one = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/private")
+                .header(COOKIE, "session=abc")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    let cookie_two = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/private")
+                .header(COOKIE, "session=abc")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(
+        response_body(cookie_one).await,
+        Bytes::from("GET:/private:3")
+    );
+    assert_eq!(
+        response_body(cookie_two).await,
+        Bytes::from("GET:/private:4")
+    );
+
+    let range_one = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/video")
+                .header(RANGE, "bytes=0-99")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    let range_two = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/video")
+                .header(RANGE, "bytes=0-99")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response_body(range_one).await, Bytes::from("GET:/video:5"));
+    assert_eq!(response_body(range_two).await, Bytes::from("GET:/video:6"));
+}
+
+#[tokio::test]
 async fn http_layer_normalizes_query_order_in_default_keys() {
     let cache = MemoryCache::default();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -232,6 +352,88 @@ async fn http_layer_normalizes_query_order_in_default_keys() {
         Bytes::from("GET:/search?b=2&a=1:1")
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn http_layer_default_keys_vary_by_host_and_accept_headers() {
+    let cache = MemoryCache::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let service = HttpSingleFlightLayer::new(cache, Duration::from_secs(1)).layer(service_fn({
+        let calls = calls.clone();
+        move |_request: Request<()>| {
+            let calls = calls.clone();
+            async move {
+                let current = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok::<_, io::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from(format!("call-{current}"))))
+                        .expect("response should build"),
+                )
+            }
+        }
+    }));
+
+    let json_one = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/users")
+                .header(HOST, "api-a.example")
+                .header(ACCEPT, "application/json")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    let json_two = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/users")
+                .header(HOST, "api-a.example")
+                .header(ACCEPT, "application/json")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response_body(json_one).await, Bytes::from("call-1"));
+    assert_eq!(response_body(json_two).await, Bytes::from("call-1"));
+
+    let html = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/users")
+                .header(HOST, "api-a.example")
+                .header(ACCEPT, "text/html")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    let other_host = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/users")
+                .header(HOST, "api-b.example")
+                .header(ACCEPT, "text/html")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response_body(html).await, Bytes::from("call-2"));
+    assert_eq!(response_body(other_host).await, Bytes::from("call-3"));
 }
 
 #[tokio::test]
@@ -381,4 +583,74 @@ async fn http_layer_supports_predicates_custom_keys_and_per_request_ttls() {
         response_body(cold_two).await,
         Bytes::from("GET:/cache/cold:5")
     );
+}
+
+#[tokio::test]
+async fn http_layer_enforces_max_response_bytes() {
+    let cache = MemoryCache::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let service = HttpSingleFlightLayer::new(cache, Duration::from_secs(1))
+        .max_response_bytes(8)
+        .error_response_with(|error| {
+            let body = error
+                .source()
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| error.to_string());
+
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from(body)))
+                .expect("response should build")
+        })
+        .layer(service_fn({
+            let calls = calls.clone();
+            move |_request: Request<()>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, io::Error>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from_static(b"0123456789")))
+                            .expect("response should build"),
+                    )
+                }
+            }
+        }));
+
+    let first = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/large")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    let second = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/large")
+                .body(())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(second.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response_body(first).await,
+        Bytes::from("length limit exceeded")
+    );
+    assert_eq!(
+        response_body(second).await,
+        Bytes::from("length limit exceeded")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
