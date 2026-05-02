@@ -1,10 +1,10 @@
 mod common;
 
-use common::MemoryCache;
-use singleflight::{
+use cacheflight::{
     CacheMissReason, CachePolicy, LookupState, MetricsHooks, RecomputeOutcome, RecomputeReason,
     Result, SingleFlight,
 };
+use common::MemoryCache;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

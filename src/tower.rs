@@ -539,7 +539,7 @@ fn default_http_error_response(_error: Error) -> Response<Full<Bytes>> {
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from_static(
-            b"singleflight middleware error",
+            b"cacheflight middleware error",
         )))
         .expect("default HTTP error response should build")
 }

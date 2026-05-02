@@ -1,12 +1,12 @@
 [package]
-name = "singleflight"
+name = "cacheflight"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Cache-backed singleflight deduplication for async Rust services with stale-while-revalidate support"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-documentation = "https://docs.rs/singleflight"
+documentation = "https://docs.rs/cacheflight"
 keywords = ["cache", "singleflight", "async", "tower", "deduplication"]
 categories = ["asynchronous", "caching", "web-programming"]
 
@@ -29,5 +29,5 @@ axum = "0.8"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
-name = "singleflight"
+name = "cacheflight"
 harness = false

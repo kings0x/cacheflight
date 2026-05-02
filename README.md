@@ -1,6 +1,6 @@
-# `singleflight`
+# `cacheflight`
 
-`singleflight` deduplicates concurrent async work for the same key and stores the result in a user-provided cache backend. It supports plain cache hits, cold-miss coordination, and stale-while-revalidate refreshes without forcing a specific cache store or serialization format.
+`cacheflight` deduplicates concurrent async work for the same key and stores the result in a user-provided cache backend. It supports plain cache hits, cold-miss coordination, and stale-while-revalidate refreshes without forcing a specific cache store or serialization format.
 
 ## What it gives you
 
@@ -14,13 +14,13 @@
 
 ```toml
 [dependencies]
-singleflight = "0.1"
+cacheflight = "0.1"
 ```
 
 ## Core example
 
 ```rust
-use singleflight::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
+use cacheflight::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
 use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 use tokio::sync::Mutex;
 
@@ -101,4 +101,4 @@ The crate ships with tests for:
 - Tower integration
 - HTTP middleware defaults and safety guards
 
-API docs: <https://docs.rs/singleflight>
+API docs: <https://docs.rs/cacheflight>

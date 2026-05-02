@@ -1,5 +1,5 @@
+use cacheflight::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use singleflight::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
 use std::{
     collections::HashMap,
     sync::{
@@ -48,9 +48,9 @@ impl CacheBackend for MemoryCache {
     }
 }
 
-fn bench_singleflight(c: &mut Criterion) {
+fn bench_cacheflight(c: &mut Criterion) {
     let runtime = Runtime::new().expect("tokio runtime should build");
-    let mut group = c.benchmark_group("singleflight");
+    let mut group = c.benchmark_group("cacheflight");
 
     group.bench_function("cache_hit", |b| {
         let singleflight = SingleFlight::new(
@@ -127,5 +127,5 @@ fn bench_singleflight(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_singleflight);
+criterion_group!(benches, bench_cacheflight);
 criterion_main!(benches);

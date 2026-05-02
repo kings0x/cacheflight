@@ -1,12 +1,12 @@
 mod support;
 
 use bytes::Bytes;
+use cacheflight::HttpSingleFlightLayer;
 use http::{
     Method, Request, Response, StatusCode,
     header::{ACCEPT, AUTHORIZATION, COOKIE, HOST, RANGE},
 };
 use http_body_util::{BodyExt, Full};
-use singleflight::HttpSingleFlightLayer;
 use std::{
     error::Error as _,
     io,
@@ -53,7 +53,7 @@ async fn http_layer_turns_internal_failures_into_http_500_by_default() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         response_body(response).await,
-        Bytes::from("singleflight middleware error")
+        Bytes::from("cacheflight middleware error")
     );
 }
 

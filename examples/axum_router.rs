@@ -8,8 +8,8 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use cacheflight::{HttpSingleFlightLayer, Result};
 use common::MemoryCache;
-use singleflight::{HttpSingleFlightLayer, Result};
 use std::{
     sync::{
         Arc,

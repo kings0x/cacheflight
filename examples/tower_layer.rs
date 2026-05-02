@@ -1,10 +1,10 @@
 mod common;
 
 use bytes::Bytes;
+use cacheflight::{HttpSingleFlightLayer, Result};
 use common::MemoryCache;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use singleflight::{HttpSingleFlightLayer, Result};
 use std::{
     sync::{
         Arc,
