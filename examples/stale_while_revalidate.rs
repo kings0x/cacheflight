@@ -1,6 +1,6 @@
 mod common;
 
-use cacheflight::{CachePolicy, LookupState, Result, SingleFlight};
+use cacheflight::{CacheFlight, CachePolicy, LookupState, Result};
 use common::MemoryCache;
 use std::sync::{
     Arc,
@@ -9,19 +9,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::{sync::Notify, time::sleep};
 
-// Run with:
-// cargo run --example stale_while_revalidate
-//
-// What this example teaches:
-// 1. How to enable stale-while-revalidate.
-// 2. Why the stale path is often the most production-friendly choice.
-// 3. How callers receive the old value immediately while a refresh happens in
-//    the background.
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cache = MemoryCache::new();
-    let singleflight = SingleFlight::new(
+    let cf = CacheFlight::new(
         cache,
         CachePolicy::new(Duration::from_millis(150))
             .with_stale_while_revalidate(Duration::from_secs(2)),
@@ -29,9 +20,8 @@ async fn main() -> Result<()> {
 
     let versions = Arc::new(AtomicUsize::new(0));
 
-    // First request: there is no cache entry yet, so the value is computed.
-    let initial = singleflight
-        .get_or_compute("dashboard:home", {
+    let initial = cf
+        .run("dashboard:home", {
             let versions = versions.clone();
             move || {
                 let versions = versions.clone();
@@ -50,7 +40,6 @@ async fn main() -> Result<()> {
         String::from_utf8_lossy(initial.value())
     );
 
-    // Wait until the entry is stale but still inside the stale window.
     sleep(Duration::from_millis(200)).await;
 
     let refresh_started = Arc::new(Notify::new());
@@ -69,8 +58,6 @@ async fn main() -> Result<()> {
             async move {
                 let version = versions.fetch_add(1, Ordering::SeqCst) + 1;
 
-                // Hold the refresh open so we can clearly see that callers are
-                // getting the stale value immediately instead of waiting.
                 refresh_started.notify_waiters();
                 release_refresh.notified().await;
 
@@ -80,8 +67,8 @@ async fn main() -> Result<()> {
     };
 
     let started = Instant::now();
-    let stale = singleflight
-        .get_or_compute("dashboard:home", refresh_work.clone())
+    let stale = cf
+        .run("dashboard:home", refresh_work.clone())
         .await?;
 
     println!(
@@ -94,10 +81,8 @@ async fn main() -> Result<()> {
 
     refresh_started.notified().await;
 
-    // Another request arrives while the refresh is still running.
-    // It also gets the stale value immediately.
-    let during_refresh = singleflight
-        .get_or_compute("dashboard:home", refresh_work.clone())
+    let during_refresh = cf
+        .run("dashboard:home", refresh_work.clone())
         .await?;
 
     println!(
@@ -107,13 +92,11 @@ async fn main() -> Result<()> {
     );
     assert_eq!(during_refresh.state(), LookupState::Stale);
 
-    // Allow the background refresh to finish.
     release_refresh.notify_waiters();
 
-    // Poll until we observe the refreshed bytes.
     let refreshed = loop {
-        let result = singleflight
-            .get_or_compute("dashboard:home", || async {
+        let result = cf
+            .run("dashboard:home", || async {
                 unreachable!("the background refresh should update the cache")
             })
             .await?;

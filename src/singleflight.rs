@@ -119,14 +119,14 @@ impl LookupResult {
 
 /// Deduplicates concurrent recomputation for the same key and stores the
 /// resulting bytes in the configured cache backend.
-pub struct SingleFlight<C, M = NoopMetrics> {
+pub struct CacheFlight<C, M = NoopMetrics> {
     cache: Arc<C>,
     metrics: Arc<M>,
     policy: CachePolicy,
     flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
 }
 
-impl<C, M> Clone for SingleFlight<C, M> {
+impl<C, M> Clone for CacheFlight<C, M> {
     fn clone(&self) -> Self {
         Self {
             cache: Arc::clone(&self.cache),
@@ -137,7 +137,7 @@ impl<C, M> Clone for SingleFlight<C, M> {
     }
 }
 
-impl<C> SingleFlight<C, NoopMetrics>
+impl<C> CacheFlight<C, NoopMetrics>
 where
     C: CacheBackend,
 {
@@ -147,7 +147,7 @@ where
     }
 }
 
-impl<C, M> SingleFlight<C, M>
+impl<C, M> CacheFlight<C, M>
 where
     C: CacheBackend,
     M: MetricsHooks,
@@ -170,6 +170,19 @@ where
     /// Returns a shared reference to the cache backend.
     pub fn cache(&self) -> &C {
         self.cache.as_ref()
+    }
+
+    /// Convenience method that calls [`Self::get_or_compute`].
+    pub async fn run<F, Fut>(
+        &self,
+        key: impl Into<String>,
+        work: F,
+    ) -> Result<LookupResult>
+    where
+        F: Fn() -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+    {
+        self.get_or_compute(key, work).await
     }
 
     /// Reads from cache when possible and deduplicates concurrent

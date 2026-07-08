@@ -3,29 +3,25 @@ name = "cacheflight"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Cache-backed singleflight deduplication for async Rust services with stale-while-revalidate support"
+description = "Cache-backed deduplication for async Rust services with stale-while-revalidate support"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/cacheflight"
-keywords = ["cache", "singleflight", "async", "tower", "deduplication"]
-categories = ["asynchronous", "caching", "web-programming"]
+keywords = ["cache", "singleflight", "async", "deduplication"]
+categories = ["asynchronous", "caching"]
 
 [dependencies]
 async-trait = "0.1"
-bytes = "1"
-http = "1"
-http-body = "1"
-http-body-util = "0.1"
+dashmap = "6"
+redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
     "sync",
     "time",
 ] }
-tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
-axum = "0.8"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]

@@ -1,4 +1,4 @@
-use cacheflight::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
+use cacheflight::{CacheBackend, CacheFlight, CachePolicy, Result, async_trait};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::{
     collections::HashMap,
@@ -53,21 +53,20 @@ fn bench_cacheflight(c: &mut Criterion) {
     let mut group = c.benchmark_group("cacheflight");
 
     group.bench_function("cache_hit", |b| {
-        let singleflight = SingleFlight::new(
+        let cf = CacheFlight::new(
             MemoryCache::default(),
             CachePolicy::new(Duration::from_secs(30)),
         );
 
         runtime.block_on(async {
-            singleflight
-                .get_or_compute("cache-hit", || async { Ok(b"payload".to_vec()) })
+            cf.run("cache-hit", || async { Ok(b"payload".to_vec()) })
                 .await
                 .expect("priming cache should succeed");
         });
 
         b.to_async(&runtime).iter(|| async {
-            let result = singleflight
-                .get_or_compute("cache-hit", || async {
+            let result = cf
+                .run("cache-hit", || async {
                     unreachable!("cache-hit benchmark should not recompute")
                 })
                 .await
@@ -78,7 +77,7 @@ fn bench_cacheflight(c: &mut Criterion) {
     });
 
     group.bench_function("contended_cold_miss_32_callers", |b| {
-        let singleflight = SingleFlight::new(
+        let cf = CacheFlight::new(
             MemoryCache::default(),
             CachePolicy::new(Duration::from_secs(30)),
         );
@@ -87,20 +86,19 @@ fn bench_cacheflight(c: &mut Criterion) {
         b.to_async(&runtime).iter_batched(
             || format!("cold-miss-{}", sequence.fetch_add(1, Ordering::Relaxed)),
             |key| {
-                let singleflight = singleflight.clone();
+                let cf = cf.clone();
 
                 async move {
                     let recomputes = Arc::new(AtomicUsize::new(0));
                     let mut tasks = Vec::with_capacity(32);
 
                     for _ in 0..32 {
-                        let singleflight = singleflight.clone();
+                        let cf = cf.clone();
                         let recomputes = Arc::clone(&recomputes);
                         let key = key.clone();
 
                         tasks.push(tokio::spawn(async move {
-                            singleflight
-                                .get_or_compute(key, move || {
+                            cf.run(key, move || {
                                     let recomputes = Arc::clone(&recomputes);
 
                                     async move {

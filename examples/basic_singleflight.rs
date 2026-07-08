@@ -1,8 +1,8 @@
 mod common;
 
 use cacheflight::{
-    CacheMissReason, CachePolicy, LookupState, MetricsHooks, RecomputeOutcome, RecomputeReason,
-    Result, SingleFlight,
+    CacheFlight, CacheMissReason, CachePolicy, LookupState, MetricsHooks, RecomputeOutcome,
+    RecomputeReason, Result,
 };
 use common::MemoryCache;
 use std::sync::{
@@ -11,17 +11,6 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::time::sleep;
-
-// Run with:
-// cargo run --example basic_singleflight
-//
-// What this example teaches:
-// 1. How to provide your own cache backend by implementing `CacheBackend`.
-// 2. How `SingleFlight` deduplicates concurrent work for the same key.
-// 3. How metrics hooks can be used to observe cache and recomputation behavior.
-//
-// The library stores raw bytes only. In a real application you would usually
-// serialize your type to bytes before returning it from the closure.
 
 #[derive(Clone, Default)]
 struct ExampleMetrics {
@@ -61,7 +50,7 @@ impl MetricsHooks for ExampleMetrics {
 async fn main() -> Result<()> {
     let cache = MemoryCache::new();
     let metrics = ExampleMetrics::default();
-    let singleflight = SingleFlight::with_metrics(
+    let cf = CacheFlight::with_metrics(
         cache,
         CachePolicy::new(Duration::from_secs(30)),
         metrics.clone(),
@@ -70,15 +59,13 @@ async fn main() -> Result<()> {
     let upstream_calls = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();
 
-    // These five requests all ask for the same key at the same time.
-    // Only one closure should actually execute.
     for request_id in 1..=5 {
-        let singleflight = singleflight.clone();
+        let cf = cf.clone();
         let upstream_calls = upstream_calls.clone();
 
         tasks.push(tokio::spawn(async move {
-            let result = singleflight
-                .get_or_compute("user:42", move || {
+            let result = cf
+                .run("user:42", move || {
                     let upstream_calls = upstream_calls.clone();
 
                     async move {
@@ -113,9 +100,8 @@ async fn main() -> Result<()> {
         assert_eq!(result.value(), br#"{"id":42,"name":"Ada"}"#);
     }
 
-    // A later request for the same key is served straight from cache.
-    let cached = singleflight
-        .get_or_compute("user:42", || async {
+    let cached = cf
+        .run("user:42", || async {
             unreachable!("the cache hit should avoid recomputing")
         })
         .await?;
@@ -138,7 +124,7 @@ async fn main() -> Result<()> {
         metrics.recomputes.load(Ordering::SeqCst),
     );
     println!(
-        "The important pattern is: implement CacheBackend, build SingleFlight, then call get_or_compute(key, work)."
+        "The important pattern is: implement CacheBackend, build CacheFlight, then call cf.run(key, work)."
     );
 
     Ok(())

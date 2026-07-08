@@ -1,8 +1,8 @@
 mod support;
 
 use cacheflight::{
-    CacheMissReason, CachePolicy, Error, LookupState, RecomputeOutcome, RecomputeReason,
-    SingleFlight,
+    CacheFlight, CacheMissReason, CachePolicy, Error, LookupState, RecomputeOutcome,
+    RecomputeReason,
 };
 use std::{
     error::Error as _,
@@ -20,7 +20,7 @@ use tokio::{sync::Notify, time::sleep};
 async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
     let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
-    let singleflight = SingleFlight::with_metrics(
+    let cf = CacheFlight::with_metrics(
         cache,
         CachePolicy::new(Duration::from_millis(250)),
         metrics.clone(),
@@ -29,12 +29,11 @@ async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
 
     let mut tasks = Vec::new();
     for _ in 0..10 {
-        let singleflight = singleflight.clone();
+        let cf = cf.clone();
         let recomputes = recomputes.clone();
 
         tasks.push(tokio::spawn(async move {
-            singleflight
-                .get_or_compute("user:42", move || {
+            cf.run("user:42", move || {
                     let recomputes = recomputes.clone();
                     async move {
                         recomputes.fetch_add(1, Ordering::SeqCst);
@@ -63,8 +62,8 @@ async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
     assert_eq!(recomputed, 1);
     assert_eq!(shared, 9);
 
-    let cached = singleflight
-        .get_or_compute("user:42", || async {
+    let cached = cf
+        .run("user:42", || async {
             unreachable!("cache hit should bypass recompute")
         })
         .await
@@ -105,7 +104,7 @@ async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
 async fn serves_stale_immediately_and_refreshes_once_in_background() {
     let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
-    let singleflight = SingleFlight::with_metrics(
+    let cf = CacheFlight::with_metrics(
         cache,
         CachePolicy::new(Duration::from_millis(120))
             .with_stale_while_revalidate(Duration::from_millis(250)),
@@ -116,8 +115,8 @@ async fn serves_stale_immediately_and_refreshes_once_in_background() {
     let release_refresh = Arc::new(Notify::new());
 
     let recomputes_for_initial = recomputes.clone();
-    let initial = singleflight
-        .get_or_compute("profile:1", move || {
+    let initial = cf
+        .run("profile:1", move || {
             let recomputes = recomputes_for_initial.clone();
             async move {
                 let attempt = recomputes.fetch_add(1, Ordering::SeqCst) + 1;
@@ -154,8 +153,8 @@ async fn serves_stale_immediately_and_refreshes_once_in_background() {
     };
 
     let started = Instant::now();
-    let stale_one = singleflight
-        .get_or_compute("profile:1", refresh_work.clone())
+    let stale_one = cf
+        .run("profile:1", refresh_work.clone())
         .await
         .expect("stale request should succeed");
     assert!(started.elapsed() < Duration::from_millis(50));
@@ -164,8 +163,8 @@ async fn serves_stale_immediately_and_refreshes_once_in_background() {
 
     refresh_started.notified().await;
 
-    let stale_two = singleflight
-        .get_or_compute("profile:1", refresh_work.clone())
+    let stale_two = cf
+        .run("profile:1", refresh_work.clone())
         .await
         .expect("stale request should succeed");
     assert_eq!(stale_two.state(), LookupState::Stale);
@@ -181,8 +180,8 @@ async fn serves_stale_immediately_and_refreshes_once_in_background() {
 
     let mut refreshed = None;
     for _ in 0..20 {
-        let result = singleflight
-            .get_or_compute("profile:1", || async {
+        let result = cf
+            .run("profile:1", || async {
                 unreachable!("background refresh should have repopulated the cache")
             })
             .await
@@ -226,12 +225,11 @@ async fn serves_stale_immediately_and_refreshes_once_in_background() {
 #[tokio::test]
 async fn expired_entries_block_when_stale_while_revalidate_is_disabled() {
     let cache = MemoryCache::default();
-    let singleflight = SingleFlight::new(cache, CachePolicy::new(Duration::from_millis(40)));
+    let cf = CacheFlight::new(cache, CachePolicy::new(Duration::from_millis(40)));
     let recomputes = Arc::new(AtomicUsize::new(0));
 
     let recomputes_for_initial = recomputes.clone();
-    singleflight
-        .get_or_compute("session:1", move || {
+    cf.run("session:1", move || {
             let recomputes = recomputes_for_initial.clone();
             async move {
                 let attempt = recomputes.fetch_add(1, Ordering::SeqCst) + 1;
@@ -244,8 +242,8 @@ async fn expired_entries_block_when_stale_while_revalidate_is_disabled() {
     sleep(Duration::from_millis(60)).await;
 
     let started = Instant::now();
-    let result = singleflight
-        .get_or_compute("session:1", move || {
+    let result = cf
+        .run("session:1", move || {
             let recomputes = recomputes.clone();
             async move {
                 let attempt = recomputes.fetch_add(1, Ordering::SeqCst) + 1;
@@ -264,7 +262,7 @@ async fn expired_entries_block_when_stale_while_revalidate_is_disabled() {
 #[tokio::test]
 async fn retries_after_recompute_failure_and_shares_the_error() {
     let cache = MemoryCache::default();
-    let singleflight = SingleFlight::new(cache, CachePolicy::new(Duration::from_millis(250)));
+    let cf = CacheFlight::new(cache, CachePolicy::new(Duration::from_millis(250)));
     let attempts = Arc::new(AtomicUsize::new(0));
 
     let failing_work = {
@@ -285,14 +283,14 @@ async fn retries_after_recompute_failure_and_shares_the_error() {
     };
 
     let request_one = {
-        let singleflight = singleflight.clone();
+        let cf = cf.clone();
         let failing_work = failing_work.clone();
-        tokio::spawn(async move { singleflight.get_or_compute("orders", failing_work).await })
+        tokio::spawn(async move { cf.run("orders", failing_work).await })
     };
     let request_two = {
-        let singleflight = singleflight.clone();
+        let cf = cf.clone();
         let failing_work = failing_work.clone();
-        tokio::spawn(async move { singleflight.get_or_compute("orders", failing_work).await })
+        tokio::spawn(async move { cf.run("orders", failing_work).await })
     };
 
     for task in [request_one, request_two] {
@@ -312,8 +310,8 @@ async fn retries_after_recompute_failure_and_shares_the_error() {
 
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
-    let retry = singleflight
-        .get_or_compute("orders", failing_work)
+    let retry = cf
+        .run("orders", failing_work)
         .await
         .expect("retry should succeed");
     assert_eq!(retry.state(), LookupState::Recomputed);
@@ -332,14 +330,14 @@ async fn ignores_invalid_cached_entries_and_records_the_miss_reason() {
         .await;
 
     let metrics = TestMetrics::default();
-    let singleflight = SingleFlight::with_metrics(
+    let cf = CacheFlight::with_metrics(
         cache,
         CachePolicy::new(Duration::from_millis(250)),
         metrics.clone(),
     );
 
-    let value = singleflight
-        .get_or_compute("broken", || async { Ok(b"recovered".to_vec()) })
+    let value = cf
+        .run("broken", || async { Ok(b"recovered".to_vec()) })
         .await
         .expect("invalid entries should be recomputed");
 
@@ -359,14 +357,14 @@ async fn cache_read_failures_are_reported_and_recomputed() {
     cache.fail_one_get();
 
     let metrics = TestMetrics::default();
-    let singleflight = SingleFlight::with_metrics(
+    let cf = CacheFlight::with_metrics(
         cache,
         CachePolicy::new(Duration::from_millis(250)),
         metrics.clone(),
     );
 
-    let value = singleflight
-        .get_or_compute("read-error", || async { Ok(b"recovered".to_vec()) })
+    let value = cf
+        .run("read-error", || async { Ok(b"recovered".to_vec()) })
         .await
         .expect("cache read failures should fall back to recompute");
 
@@ -384,7 +382,7 @@ async fn cache_write_failures_are_reported_without_failing_the_request() {
     cache.fail_one_set();
 
     let metrics = TestMetrics::default();
-    let singleflight = SingleFlight::with_metrics(
+    let cf = CacheFlight::with_metrics(
         cache.clone(),
         CachePolicy::new(Duration::from_millis(250)),
         metrics.clone(),
@@ -402,14 +400,14 @@ async fn cache_write_failures_are_reported_without_failing_the_request() {
         }
     };
 
-    let first = singleflight
-        .get_or_compute("payments", work.clone())
+    let first = cf
+        .run("payments", work.clone())
         .await
         .expect("cache write failures should not fail the caller");
     assert_eq!(first.value(), b"value-1");
 
-    let second = singleflight
-        .get_or_compute("payments", work)
+    let second = cf
+        .run("payments", work)
         .await
         .expect("missing cache entry should recompute");
     assert_eq!(second.value(), b"value-2");
