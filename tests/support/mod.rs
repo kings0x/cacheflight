@@ -116,6 +116,7 @@ pub struct MetricsSnapshot {
     pub deduplicated: Vec<RecomputeReason>,
     pub recompute_started: Vec<RecomputeReason>,
     pub recompute_finished: Vec<(RecomputeReason, RecomputeOutcome)>,
+    pub xfetch_early_refreshes: usize,
 }
 
 impl TestMetrics {
@@ -186,6 +187,13 @@ impl MetricsHooks for TestMetrics {
             .lock()
             .expect("metrics mutex poisoned")
             .cache_write_failures += 1;
+    }
+
+    fn on_xfetch_early_refresh(&self, _key: &str) {
+        self.inner
+            .lock()
+            .expect("metrics mutex poisoned")
+            .xfetch_early_refreshes += 1;
     }
 }
 

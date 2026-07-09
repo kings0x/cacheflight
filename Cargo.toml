@@ -14,6 +14,8 @@ categories = ["asynchronous", "caching"]
 async-trait = "0.1"
 dashmap = "6"
 redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
+fastrand = "2"
+thiserror = "2"
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
@@ -23,6 +25,7 @@ tokio = { version = "1", features = [
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
+testcontainers = { version = "0", default-features = false, features = ["tokio"] }
 
 [[bench]]
 name = "cacheflight"

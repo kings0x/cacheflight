@@ -1,6 +1,6 @@
 mod common;
 
-use cacheflight::{CacheFlight, CachePolicy, LookupState, Result};
+use cacheflight::{CacheFlight, LookupState, Result};
 use common::MemoryCache;
 use std::sync::{
     Arc,
@@ -12,11 +12,8 @@ use tokio::{sync::Notify, time::sleep};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cache = MemoryCache::new();
-    let cf = CacheFlight::new(
-        cache,
-        CachePolicy::new(Duration::from_millis(150))
-            .with_stale_while_revalidate(Duration::from_secs(2)),
-    );
+    let cf = CacheFlight::new(cache)
+        .stale_while_revalidate(Duration::from_millis(150), Duration::from_secs(2));
 
     let versions = Arc::new(AtomicUsize::new(0));
 
@@ -67,9 +64,7 @@ async fn main() -> Result<()> {
     };
 
     let started = Instant::now();
-    let stale = cf
-        .run("dashboard:home", refresh_work.clone())
-        .await?;
+    let stale = cf.run("dashboard:home", refresh_work.clone()).await?;
 
     println!(
         "stale request: state={:?}, returned in {:?}, value={}",
@@ -81,9 +76,7 @@ async fn main() -> Result<()> {
 
     refresh_started.notified().await;
 
-    let during_refresh = cf
-        .run("dashboard:home", refresh_work.clone())
-        .await?;
+    let during_refresh = cf.run("dashboard:home", refresh_work.clone()).await?;
 
     println!(
         "second stale request during refresh: state={:?}, value={}",

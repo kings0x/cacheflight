@@ -1,9 +1,6 @@
 mod common;
 
-use cacheflight::{
-    CacheFlight, CacheMissReason, CachePolicy, LookupState, MetricsHooks, RecomputeOutcome,
-    RecomputeReason, Result,
-};
+use cacheflight::{CacheFlight, LookupState, MetricsHooks, RecomputeOutcome, RecomputeReason, Result};
 use common::MemoryCache;
 use std::sync::{
     Arc,
@@ -25,7 +22,7 @@ impl MetricsHooks for ExampleMetrics {
         self.cache_hits.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn on_cache_miss(&self, _key: &str, _reason: CacheMissReason) {
+    fn on_cache_miss(&self, _key: &str, _reason: cacheflight::CacheMissReason) {
         self.cache_misses.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -50,11 +47,8 @@ impl MetricsHooks for ExampleMetrics {
 async fn main() -> Result<()> {
     let cache = MemoryCache::new();
     let metrics = ExampleMetrics::default();
-    let cf = CacheFlight::with_metrics(
-        cache,
-        CachePolicy::new(Duration::from_secs(30)),
-        metrics.clone(),
-    );
+    let cf = CacheFlight::with_metrics(cache, metrics.clone())
+        .ttl(Duration::from_secs(30));
 
     let upstream_calls = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();
@@ -79,7 +73,7 @@ async fn main() -> Result<()> {
                     }
                 })
                 .await
-                .expect("singleflight request should succeed");
+                .expect("cacheflight request should succeed");
 
             println!(
                 "request {request_id}: state={:?}, body={}",

@@ -1,8 +1,7 @@
 mod support;
 
 use cacheflight::{
-    CacheFlight, CacheMissReason, CachePolicy, Error, LookupState, RecomputeOutcome,
-    RecomputeReason,
+    CacheFlight, CacheMissReason, Error, LookupState, RecomputeOutcome, RecomputeReason,
 };
 use std::{
     error::Error as _,
@@ -20,11 +19,8 @@ use tokio::{sync::Notify, time::sleep};
 async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
     let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(
-        cache,
-        CachePolicy::new(Duration::from_millis(250)),
-        metrics.clone(),
-    );
+    let cf = CacheFlight::with_metrics(cache, metrics.clone())
+        .ttl(Duration::from_millis(250));
     let recomputes = Arc::new(AtomicUsize::new(0));
 
     let mut tasks = Vec::new();
@@ -104,12 +100,8 @@ async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
 async fn serves_stale_immediately_and_refreshes_once_in_background() {
     let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(
-        cache,
-        CachePolicy::new(Duration::from_millis(120))
-            .with_stale_while_revalidate(Duration::from_millis(250)),
-        metrics.clone(),
-    );
+    let cf = CacheFlight::with_metrics(cache, metrics.clone())
+        .stale_while_revalidate(Duration::from_millis(120), Duration::from_millis(250));
     let recomputes = Arc::new(AtomicUsize::new(0));
     let refresh_started = Arc::new(Notify::new());
     let release_refresh = Arc::new(Notify::new());
@@ -225,7 +217,7 @@ async fn serves_stale_immediately_and_refreshes_once_in_background() {
 #[tokio::test]
 async fn expired_entries_block_when_stale_while_revalidate_is_disabled() {
     let cache = MemoryCache::default();
-    let cf = CacheFlight::new(cache, CachePolicy::new(Duration::from_millis(40)));
+    let cf = CacheFlight::new(cache).ttl(Duration::from_millis(40));
     let recomputes = Arc::new(AtomicUsize::new(0));
 
     let recomputes_for_initial = recomputes.clone();
@@ -262,7 +254,7 @@ async fn expired_entries_block_when_stale_while_revalidate_is_disabled() {
 #[tokio::test]
 async fn retries_after_recompute_failure_and_shares_the_error() {
     let cache = MemoryCache::default();
-    let cf = CacheFlight::new(cache, CachePolicy::new(Duration::from_millis(250)));
+    let cf = CacheFlight::new(cache).ttl(Duration::from_millis(250));
     let attempts = Arc::new(AtomicUsize::new(0));
 
     let failing_work = {
@@ -324,17 +316,14 @@ async fn ignores_invalid_cached_entries_and_records_the_miss_reason() {
     cache
         .insert_raw(
             "broken",
-            b"not-a-valid-singleflight-entry".to_vec(),
+            b"not-a-valid-cacheflight-entry".to_vec(),
             Duration::from_secs(1),
         )
         .await;
 
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(
-        cache,
-        CachePolicy::new(Duration::from_millis(250)),
-        metrics.clone(),
-    );
+    let cf = CacheFlight::with_metrics(cache, metrics.clone())
+        .ttl(Duration::from_millis(250));
 
     let value = cf
         .run("broken", || async { Ok(b"recovered".to_vec()) })
@@ -357,11 +346,8 @@ async fn cache_read_failures_are_reported_and_recomputed() {
     cache.fail_one_get();
 
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(
-        cache,
-        CachePolicy::new(Duration::from_millis(250)),
-        metrics.clone(),
-    );
+    let cf = CacheFlight::with_metrics(cache, metrics.clone())
+        .ttl(Duration::from_millis(250));
 
     let value = cf
         .run("read-error", || async { Ok(b"recovered".to_vec()) })
@@ -382,11 +368,8 @@ async fn cache_write_failures_are_reported_without_failing_the_request() {
     cache.fail_one_set();
 
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(
-        cache.clone(),
-        CachePolicy::new(Duration::from_millis(250)),
-        metrics.clone(),
-    );
+    let cf = CacheFlight::with_metrics(cache.clone(), metrics.clone())
+        .ttl(Duration::from_millis(250));
     let recomputes = Arc::new(AtomicUsize::new(0));
 
     let work = {

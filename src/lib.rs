@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![warn(missing_docs, rust_2018_idioms)]
 
 //! Deduplicates concurrent async work for the same cache key.
 //!
@@ -10,12 +9,13 @@
 //! # Example
 //!
 //! ```no_run
-//! use cacheflight::{CacheFlight, CachePolicy, MemoryCache, Result};
+//! use cacheflight::{CacheFlight, MemoryCache, Result};
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
-//!     let cf = CacheFlight::new(MemoryCache::new(), CachePolicy::new(Duration::from_secs(30)));
+//!     let cf = CacheFlight::new(MemoryCache::new())
+//!         .ttl(Duration::from_secs(30));
 //!
 //!     let result = cf.run("user:42", || async {
 //!         let body = br#"{"id":42,"name":"Ada"}"#.to_vec();
@@ -28,18 +28,21 @@
 //! ```
 
 mod cache;
+mod cacheflight;
 mod error;
 mod memory;
 mod metrics;
-mod policy;
 mod redis;
-mod singleflight;
 
 pub use async_trait::async_trait;
 pub use cache::CacheBackend;
+pub use cacheflight::{
+    CacheFlight, ComputeValue, LookupResult, LookupState, NoExpiry, HasFlatExpiry, HasSwrExpiry,
+    NoXfetch, HasXfetch,
+};
 pub use error::{Error, ErrorSource, Result};
 pub use memory::MemoryCache;
-pub use metrics::{CacheMissReason, MetricsHooks, NoopMetrics, RecomputeOutcome, RecomputeReason};
-pub use policy::CachePolicy;
+pub use metrics::{
+    CacheMissReason, MetricsHooks, NoopMetrics, RecomputeOutcome, RecomputeReason,
+};
 pub use redis::RedisCache;
-pub use singleflight::{CacheFlight, ComputeValue, LookupResult, LookupState};

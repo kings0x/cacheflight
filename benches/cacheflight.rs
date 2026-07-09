@@ -1,4 +1,4 @@
-use cacheflight::{CacheBackend, CacheFlight, CachePolicy, Result, async_trait};
+use cacheflight::{CacheBackend, CacheFlight, Result, async_trait};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::{
     collections::HashMap,
@@ -53,10 +53,7 @@ fn bench_cacheflight(c: &mut Criterion) {
     let mut group = c.benchmark_group("cacheflight");
 
     group.bench_function("cache_hit", |b| {
-        let cf = CacheFlight::new(
-            MemoryCache::default(),
-            CachePolicy::new(Duration::from_secs(30)),
-        );
+        let cf = CacheFlight::new(MemoryCache::default()).ttl(Duration::from_secs(30));
 
         runtime.block_on(async {
             cf.run("cache-hit", || async { Ok(b"payload".to_vec()) })
@@ -77,10 +74,7 @@ fn bench_cacheflight(c: &mut Criterion) {
     });
 
     group.bench_function("contended_cold_miss_32_callers", |b| {
-        let cf = CacheFlight::new(
-            MemoryCache::default(),
-            CachePolicy::new(Duration::from_secs(30)),
-        );
+        let cf = CacheFlight::new(MemoryCache::default()).ttl(Duration::from_secs(30));
         let sequence = AtomicUsize::new(0);
 
         b.to_async(&runtime).iter_batched(
