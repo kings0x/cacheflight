@@ -19,8 +19,7 @@ use tokio::{sync::Notify, time::sleep};
 async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
     let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(cache, metrics.clone())
-        .ttl(Duration::from_millis(250));
+    let cf = CacheFlight::with_metrics(cache, metrics.clone()).ttl(Duration::from_millis(250));
     let recomputes = Arc::new(AtomicUsize::new(0));
 
     let mut tasks = Vec::new();
@@ -30,14 +29,14 @@ async fn deduplicates_concurrent_cold_requests_and_populates_cache() {
 
         tasks.push(tokio::spawn(async move {
             cf.run("user:42", move || {
-                    let recomputes = recomputes.clone();
-                    async move {
-                        recomputes.fetch_add(1, Ordering::SeqCst);
-                        sleep(Duration::from_millis(40)).await;
-                        Ok(b"payload".to_vec())
-                    }
-                })
-                .await
+                let recomputes = recomputes.clone();
+                async move {
+                    recomputes.fetch_add(1, Ordering::SeqCst);
+                    sleep(Duration::from_millis(40)).await;
+                    Ok(b"payload".to_vec())
+                }
+            })
+            .await
         }));
     }
 
@@ -222,14 +221,14 @@ async fn expired_entries_block_when_stale_while_revalidate_is_disabled() {
 
     let recomputes_for_initial = recomputes.clone();
     cf.run("session:1", move || {
-            let recomputes = recomputes_for_initial.clone();
-            async move {
-                let attempt = recomputes.fetch_add(1, Ordering::SeqCst) + 1;
-                Ok(format!("session-{attempt}").into_bytes())
-            }
-        })
-        .await
-        .expect("initial fill should succeed");
+        let recomputes = recomputes_for_initial.clone();
+        async move {
+            let attempt = recomputes.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(format!("session-{attempt}").into_bytes())
+        }
+    })
+    .await
+    .expect("initial fill should succeed");
 
     sleep(Duration::from_millis(60)).await;
 
@@ -322,8 +321,7 @@ async fn ignores_invalid_cached_entries_and_records_the_miss_reason() {
         .await;
 
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(cache, metrics.clone())
-        .ttl(Duration::from_millis(250));
+    let cf = CacheFlight::with_metrics(cache, metrics.clone()).ttl(Duration::from_millis(250));
 
     let value = cf
         .run("broken", || async { Ok(b"recovered".to_vec()) })
@@ -346,8 +344,7 @@ async fn cache_read_failures_are_reported_and_recomputed() {
     cache.fail_one_get();
 
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(cache, metrics.clone())
-        .ttl(Duration::from_millis(250));
+    let cf = CacheFlight::with_metrics(cache, metrics.clone()).ttl(Duration::from_millis(250));
 
     let value = cf
         .run("read-error", || async { Ok(b"recovered".to_vec()) })
@@ -368,8 +365,8 @@ async fn cache_write_failures_are_reported_without_failing_the_request() {
     cache.fail_one_set();
 
     let metrics = TestMetrics::default();
-    let cf = CacheFlight::with_metrics(cache.clone(), metrics.clone())
-        .ttl(Duration::from_millis(250));
+    let cf =
+        CacheFlight::with_metrics(cache.clone(), metrics.clone()).ttl(Duration::from_millis(250));
     let recomputes = Arc::new(AtomicUsize::new(0));
 
     let work = {

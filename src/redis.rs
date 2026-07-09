@@ -24,7 +24,7 @@ impl CacheBackend for RedisCache {
             .arg(key)
             .query_async::<Option<Vec<u8>>>(&mut self.conn.clone())
             .await
-            .map_err(|e| Error::cache_read(e))
+            .map_err(Error::cache_read)
     }
 
     async fn set(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<()> {
@@ -35,6 +35,6 @@ impl CacheBackend for RedisCache {
             .arg(value)
             .query_async::<()>(&mut self.conn.clone())
             .await
-            .map_err(|e| Error::cache_write(e))
+            .map_err(Error::cache_write)
     }
 }

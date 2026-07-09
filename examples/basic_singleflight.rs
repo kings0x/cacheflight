@@ -1,6 +1,8 @@
 mod common;
 
-use cacheflight::{CacheFlight, LookupState, MetricsHooks, RecomputeOutcome, RecomputeReason, Result};
+use cacheflight::{
+    CacheFlight, LookupState, MetricsHooks, RecomputeOutcome, RecomputeReason, Result,
+};
 use common::MemoryCache;
 use std::sync::{
     Arc,
@@ -47,8 +49,7 @@ impl MetricsHooks for ExampleMetrics {
 async fn main() -> Result<()> {
     let cache = MemoryCache::new();
     let metrics = ExampleMetrics::default();
-    let cf = CacheFlight::with_metrics(cache, metrics.clone())
-        .ttl(Duration::from_secs(30));
+    let cf = CacheFlight::with_metrics(cache, metrics.clone()).ttl(Duration::from_secs(30));
 
     let upstream_calls = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();

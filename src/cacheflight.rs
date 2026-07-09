@@ -302,14 +302,16 @@ where
             }
 
             cf.run_recompute(
-                key,
-                flight,
+                RecomputeParams {
+                    key,
+                    flight,
+                    total_ttl: total,
+                    fresh_ttl: effective_fresh,
+                    previous_delta_ema: None,
+                    reason: RecomputeReason::ColdMiss,
+                    state: LookupState::Recomputed,
+                },
                 wrapped,
-                total,
-                effective_fresh,
-                None,
-                RecomputeReason::ColdMiss,
-                LookupState::Recomputed,
             )
             .await
         })
@@ -484,6 +486,16 @@ impl<B: CacheBackend, X> CacheFlight<B, HasSwrExpiry, X> {
 
 // ── Internal helpers (available on all variants) ────────────────────────────
 
+struct RecomputeParams {
+    key: String,
+    flight: Arc<Flight>,
+    total_ttl: Duration,
+    fresh_ttl: Duration,
+    previous_delta_ema: Option<f64>,
+    reason: RecomputeReason,
+    state: LookupState,
+}
+
 impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheFlight<B, E, X> {
     async fn start_or_join_flight(&self, key: &str) -> (Arc<Flight>, bool) {
         let mut flights = self.flights.lock().await;
@@ -540,14 +552,16 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
         tokio::spawn(async move {
             let _ = this
                 .run_recompute(
-                    key,
-                    flight,
+                    RecomputeParams {
+                        key,
+                        flight,
+                        total_ttl,
+                        fresh_ttl,
+                        previous_delta_ema: Some(previous_delta_ema),
+                        reason,
+                        state: LookupState::Recomputed,
+                    },
                     work,
-                    total_ttl,
-                    fresh_ttl,
-                    Some(previous_delta_ema),
-                    reason,
-                    LookupState::Recomputed,
                 )
                 .await;
         });
@@ -555,20 +569,14 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
 
     async fn run_recompute<F, Fut>(
         &self,
-        key: String,
-        flight: Arc<Flight>,
+        p: RecomputeParams,
         work: F,
-        total_ttl: Duration,
-        fresh_ttl: Duration,
-        previous_delta_ema: Option<f64>,
-        reason: RecomputeReason,
-        state: LookupState,
     ) -> Result<LookupResult>
     where
         F: Fn() -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<ComputeValue>> + Send + 'static,
     {
-        self.metrics.on_recompute_started(&key, reason);
+        self.metrics.on_recompute_started(&p.key, p.reason);
         let started_at = Instant::now();
 
         let result = match work().await {
@@ -577,13 +585,13 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
 
                 if should_cache {
                     let elapsed = started_at.elapsed();
-                    let delta_ema = compute_new_delta_ema(previous_delta_ema, elapsed);
-                    let stale_ttl = total_ttl.checked_sub(fresh_ttl).unwrap_or(Duration::ZERO);
+                    let delta_ema = compute_new_delta_ema(p.previous_delta_ema, elapsed);
+                    let stale_ttl = p.total_ttl.checked_sub(p.fresh_ttl).unwrap_or(Duration::ZERO);
                     let encoded_entry =
-                        encode_cached_entry(&value, fresh_ttl, stale_ttl, delta_ema);
+                        encode_cached_entry(&value, p.fresh_ttl, stale_ttl, delta_ema);
 
-                    if let Err(error) = self.cache.set(&key, encoded_entry, total_ttl).await {
-                        self.metrics.on_cache_write_failed(&key, &error);
+                    if let Err(error) = self.cache.set(&p.key, encoded_entry, p.total_ttl).await {
+                        self.metrics.on_cache_write_failed(&p.key, &error);
                     }
                 }
 
@@ -593,8 +601,8 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
         };
 
         self.metrics.on_recompute_finished(
-            &key,
-            reason,
+            &p.key,
+            p.reason,
             if result.is_ok() {
                 RecomputeOutcome::Success
             } else {
@@ -603,10 +611,10 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
             started_at.elapsed(),
         );
 
-        let _ = flight.notifier.send(Some(result.clone()));
-        self.finish_flight(&key).await;
+        let _ = p.flight.notifier.send(Some(result.clone()));
+        self.finish_flight(&p.key).await;
 
-        result.map(|value| LookupResult::new((*value).clone(), state))
+        result.map(|value| LookupResult::new((*value).clone(), p.state))
     }
 
     async fn finish_flight(&self, key: &str) {

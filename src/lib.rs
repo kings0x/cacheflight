@@ -37,12 +37,10 @@ mod redis;
 pub use async_trait::async_trait;
 pub use cache::CacheBackend;
 pub use cacheflight::{
-    CacheFlight, ComputeValue, LookupResult, LookupState, NoExpiry, HasFlatExpiry, HasSwrExpiry,
-    NoXfetch, HasXfetch,
+    CacheFlight, ComputeValue, HasFlatExpiry, HasSwrExpiry, HasXfetch, LookupResult, LookupState,
+    NoExpiry, NoXfetch,
 };
 pub use error::{Error, ErrorSource, Result};
 pub use memory::MemoryCache;
-pub use metrics::{
-    CacheMissReason, MetricsHooks, NoopMetrics, RecomputeOutcome, RecomputeReason,
-};
+pub use metrics::{CacheMissReason, MetricsHooks, NoopMetrics, RecomputeOutcome, RecomputeReason};
 pub use redis::RedisCache;
