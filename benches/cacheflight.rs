@@ -219,12 +219,12 @@ fn bench_cacheflight(c: &mut Criterion) {
         // Prime 4 keys — 2 fresh (just primed), 2 about to go stale.
         runtime.block_on(async {
             for i in 0..2 {
-                cf.run(&format!("mixed-{i}"), || async { Ok(b"payload".to_vec()) })
+                cf.run(format!("mixed-{i}"), || async { Ok(b"payload".to_vec()) })
                     .await
                     .expect("prime fresh");
             }
             for i in 2..4 {
-                cf.run(&format!("mixed-{i}"), || async {
+                cf.run(format!("mixed-{i}"), || async {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     Ok(b"payload".to_vec())
                 })

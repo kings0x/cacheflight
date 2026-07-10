@@ -677,7 +677,8 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
                 )
                 .await;
             if let Err(error) = result {
-                this.metrics.on_background_refresh_failed(&key, reason, &error);
+                this.metrics
+                    .on_background_refresh_failed(&key, reason, &error);
             }
         });
     }

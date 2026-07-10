@@ -69,7 +69,7 @@ impl CacheBackend for RedisCache {
             .arg(&pattern)
             .invoke_async::<i64>(&mut self.conn.clone())
             .await
-            .map_err(|e| Error::cache_write(e))
+            .map_err(Error::cache_write)
             .map(|n| n as u64)
     }
 }

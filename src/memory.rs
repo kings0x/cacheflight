@@ -1,8 +1,8 @@
 use crate::{CacheBackend, Error, Result, async_trait};
 use dashmap::DashMap;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
