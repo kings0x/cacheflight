@@ -1,7 +1,8 @@
 mod support;
 
 use cacheflight::{
-    CacheFlight, CacheMissReason, Error, LookupState, RecomputeOutcome, RecomputeReason,
+    CacheFlight, CacheMissReason, Error, LookupState, MemoryCache, RecomputeOutcome,
+    RecomputeReason,
 };
 use std::{
     error::Error as _,
@@ -12,7 +13,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use support::{MemoryCache, TestMetrics, wait_until};
+use support::{TestMetrics, wait_until};
 use tokio::{sync::Notify, time::sleep};
 
 #[tokio::test]
@@ -312,13 +313,11 @@ async fn retries_after_recompute_failure_and_shares_the_error() {
 #[tokio::test]
 async fn ignores_invalid_cached_entries_and_records_the_miss_reason() {
     let cache = MemoryCache::default();
-    cache
-        .insert_raw(
-            "broken",
-            b"not-a-valid-cacheflight-entry".to_vec(),
-            Duration::from_secs(1),
-        )
-        .await;
+    cache.insert_raw(
+        "broken",
+        b"not-a-valid-cacheflight-entry".to_vec(),
+        Duration::from_secs(1),
+    );
 
     let metrics = TestMetrics::default();
     let cf = CacheFlight::with_metrics(cache, metrics.clone()).ttl(Duration::from_millis(250));

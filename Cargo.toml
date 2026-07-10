@@ -10,10 +10,14 @@ documentation = "https://docs.rs/cacheflight"
 keywords = ["cache", "singleflight", "async", "deduplication"]
 categories = ["asynchronous", "caching"]
 
+[features]
+default = ["redis"]
+redis = ["dep:redis"]
+
 [dependencies]
 async-trait = "0.1"
 dashmap = "6"
-redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.28", features = ["tokio-comp", "connection-manager"], optional = true }
 fastrand = "2"
 thiserror = "2"
 tokio = { version = "1", features = [

@@ -1,52 +1,13 @@
-use cacheflight::{CacheBackend, CacheFlight, Result, async_trait};
+use cacheflight::{CacheFlight, MemoryCache};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::{runtime::Runtime, sync::Mutex};
-
-#[derive(Clone, Default)]
-struct MemoryCache {
-    entries: Arc<Mutex<HashMap<String, CacheEntry>>>,
-}
-
-#[derive(Clone)]
-struct CacheEntry {
-    value: Vec<u8>,
-    expires_at: Instant,
-}
-
-#[async_trait]
-impl CacheBackend for MemoryCache {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let mut entries = self.entries.lock().await;
-
-        match entries.get(key) {
-            Some(entry) if entry.expires_at > Instant::now() => Ok(Some(entry.value.clone())),
-            Some(_) => {
-                entries.remove(key);
-                Ok(None)
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<()> {
-        self.entries.lock().await.insert(
-            key.to_owned(),
-            CacheEntry {
-                value,
-                expires_at: Instant::now() + ttl,
-            },
-        );
-        Ok(())
-    }
-}
+use tokio::runtime::Runtime;
 
 fn bench_cacheflight(c: &mut Criterion) {
     let runtime = Runtime::new().expect("tokio runtime should build");

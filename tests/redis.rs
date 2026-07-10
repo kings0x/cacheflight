@@ -1,3 +1,5 @@
+#![cfg(feature = "redis")]
+
 use cacheflight::{CacheFlight, LookupState, RedisCache, Result};
 use std::time::Duration;
 

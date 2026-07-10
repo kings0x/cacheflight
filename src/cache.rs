@@ -17,4 +17,12 @@ pub trait CacheBackend: Send + Sync + 'static {
 
     /// Stores raw cached bytes for `key` with the provided TTL.
     async fn set(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<()>;
+
+    /// Removes the cached entry for `key` from the backend.
+    async fn delete(&self, key: &str) -> Result<()>;
+
+    /// Removes all cached entries whose key starts with `prefix`.
+    ///
+    /// Returns the number of entries that were removed.
+    async fn delete_by_prefix(&self, prefix: &str) -> Result<u64>;
 }

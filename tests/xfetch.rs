@@ -1,6 +1,6 @@
 mod support;
 
-use cacheflight::{CacheFlight, LookupState};
+use cacheflight::{CacheFlight, LookupState, MemoryCache};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -14,7 +14,7 @@ use tokio::time::sleep;
 /// runs in the background.
 #[tokio::test]
 async fn xfetch_triggers_background_refresh_during_fresh_window() {
-    let cache = support::MemoryCache::default();
+    let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
     let cf = CacheFlight::with_metrics(cache, metrics.clone())
         .ttl(Duration::from_millis(500))
@@ -22,7 +22,6 @@ async fn xfetch_triggers_background_refresh_during_fresh_window() {
 
     let recomputes = Arc::new(AtomicUsize::new(0));
 
-    // Prime the cache with a slow compute (large delta_ema).
     cf.run("k", {
         let recomputes = recomputes.clone();
         move || {
@@ -48,7 +47,6 @@ async fn xfetch_triggers_background_refresh_during_fresh_window() {
                 move || {
                     let recomputes = recomputes.clone();
                     async move {
-                        // XFetch may call this as a background refresh.
                         recomputes.fetch_add(1, Ordering::SeqCst);
                         sleep(Duration::from_millis(80)).await;
                         Ok(b"value".to_vec())
@@ -62,7 +60,6 @@ async fn xfetch_triggers_background_refresh_during_fresh_window() {
         assert_eq!(result.value(), b"value");
 
         if prev < recomputes.load(Ordering::SeqCst) {
-            // XFetch triggered a background refresh.
             break;
         }
 
@@ -84,7 +81,7 @@ async fn xfetch_triggers_background_refresh_during_fresh_window() {
 /// When beta is zero, XFetch never triggers regardless of compute duration.
 #[tokio::test]
 async fn xfetch_does_not_trigger_when_beta_is_zero() {
-    let cache = support::MemoryCache::default();
+    let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
     let cf = CacheFlight::with_metrics(cache, metrics.clone())
         .ttl(Duration::from_millis(500))
@@ -136,7 +133,7 @@ async fn xfetch_does_not_trigger_when_beta_is_zero() {
 /// cacheflight instance, so no early refresh can occur.
 #[tokio::test]
 async fn xfetch_requires_probabilistic_expiry() {
-    let cache = support::MemoryCache::default();
+    let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
     // HasFlatExpiry, NoXfetch — no beta possible.
     let cf = CacheFlight::with_metrics(cache, metrics.clone()).ttl(Duration::from_millis(500));
@@ -182,7 +179,7 @@ async fn xfetch_requires_probabilistic_expiry() {
 /// just like with flat TTL.  Stale hits are returned once the entry ages.
 #[tokio::test]
 async fn xfetch_triggers_during_swr_fresh_window() {
-    let cache = support::MemoryCache::default();
+    let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
     let cf = CacheFlight::with_metrics(cache, metrics.clone())
         .stale_while_revalidate(Duration::from_millis(300), Duration::from_millis(1000))
@@ -265,7 +262,7 @@ async fn xfetch_triggers_during_swr_fresh_window() {
 /// early because delta_ema * beta * (-ln(r)) is small.
 #[tokio::test]
 async fn xfetch_rarely_triggers_with_fast_compute() {
-    let cache = support::MemoryCache::default();
+    let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
     let cf = CacheFlight::with_metrics(cache, metrics.clone())
         .ttl(Duration::from_millis(500))
@@ -326,7 +323,7 @@ async fn xfetch_rarely_triggers_with_fast_compute() {
 /// same ongoing recompute and only one background refresh starts.
 #[tokio::test]
 async fn xfetch_deduplicates_concurrent_background_refreshes() {
-    let cache = support::MemoryCache::default();
+    let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
     let cf = CacheFlight::with_metrics(cache, metrics.clone())
         .ttl(Duration::from_millis(500))
@@ -334,7 +331,6 @@ async fn xfetch_deduplicates_concurrent_background_refreshes() {
 
     let recomputes = Arc::new(AtomicUsize::new(0));
 
-    // Prime the cache.
     cf.run("k", {
         let recomputes = recomputes.clone();
         move || {
@@ -388,7 +384,6 @@ async fn xfetch_deduplicates_concurrent_background_refreshes() {
         "at least one XFetch early refresh should have been triggered"
     );
 
-    // At least one deduplicated event should have occurred.
     let dedup_count = metrics
         .snapshot()
         .deduplicated
@@ -409,7 +404,7 @@ async fn xfetch_deduplicates_concurrent_background_refreshes() {
 /// Multiple XFetch early-refresh events for different keys work independently.
 #[tokio::test]
 async fn xfetch_independent_keys() {
-    let cache = support::MemoryCache::default();
+    let cache = MemoryCache::default();
     let metrics = TestMetrics::default();
     let cf = CacheFlight::with_metrics(cache, metrics.clone())
         .ttl(Duration::from_millis(500))
@@ -417,7 +412,6 @@ async fn xfetch_independent_keys() {
 
     let recomputes = Arc::new(AtomicUsize::new(0));
 
-    // Prime two independent keys.
     for key in ["a", "b"] {
         cf.run(key, {
             let recomputes = recomputes.clone();

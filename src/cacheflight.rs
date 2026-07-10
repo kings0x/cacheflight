@@ -4,6 +4,7 @@ use crate::{
 };
 use std::{
     collections::HashMap,
+    fmt,
     future::Future,
     marker::PhantomData,
     pin::Pin,
@@ -113,39 +114,51 @@ impl LookupResult {
         Self { value, state }
     }
 
+    /// Returns a reference to the cached value.
     pub fn value(&self) -> &[u8] {
         &self.value
     }
 
+    /// Consumes the result and returns the owned value.
     pub fn into_value(self) -> Vec<u8> {
         self.value
     }
 
+    /// Returns how this result was served (fresh, stale, recomputed, or shared).
     pub fn state(&self) -> LookupState {
         self.state
     }
 }
 
+/// Wraps a computed value so the engine can distinguish successful results
+/// from errors during the cache-update path.
+///
+/// Users return `ComputeValue::new(value)` from their work closure inside
+/// a `Result::Ok`. The engine always caches the value on success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputeValue {
     value: Vec<u8>,
-    cache: bool,
 }
 
 impl ComputeValue {
-    pub fn cache(value: Vec<u8>) -> Self {
-        Self { value, cache: true }
+    /// Wraps `value` for caching. Always cached.
+    pub fn new(value: Vec<u8>) -> Self {
+        Self { value }
     }
 
-    pub fn do_not_cache(value: Vec<u8>) -> Self {
-        Self {
-            value,
-            cache: false,
+    fn into_value(self) -> Vec<u8> {
+        self.value
+    }
+}
+
+impl fmt::Display for LookupState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CacheHit => write!(f, "cache_hit"),
+            Self::Stale => write!(f, "stale"),
+            Self::Recomputed => write!(f, "recomputed"),
+            Self::Shared => write!(f, "shared"),
         }
-    }
-
-    fn into_parts(self) -> (Vec<u8>, bool) {
-        (self.value, self.cache)
     }
 }
 
@@ -165,6 +178,7 @@ pub struct RunBuilder<'a, B, E, X, F> {
 }
 
 impl<'a, B, X, F> RunBuilder<'a, B, HasFlatExpiry, X, F> {
+    /// Overrides the TTL for this single call.
     pub fn ttl(mut self, duration: Duration) -> Self {
         self.fresh_override = Some(duration);
         self
@@ -172,16 +186,19 @@ impl<'a, B, X, F> RunBuilder<'a, B, HasFlatExpiry, X, F> {
 }
 
 impl<'a, B, X, F> RunBuilder<'a, B, HasSwrExpiry, X, F> {
+    /// Overrides the fresh window for this single call.
     pub fn fresh_for(mut self, duration: Duration) -> Self {
         self.fresh_override = Some(duration);
         self
     }
 
+    /// Overrides the stale window for this single call.
     pub fn stale_for(mut self, duration: Duration) -> Self {
         self.stale_override = Some(duration);
         self
     }
 
+    /// Overrides both fresh and stale windows for this single call.
     pub fn stale_while_revalidate(mut self, fresh: Duration, stale: Duration) -> Self {
         self.fresh_override = Some(fresh);
         self.stale_override = Some(stale);
@@ -190,6 +207,7 @@ impl<'a, B, X, F> RunBuilder<'a, B, HasSwrExpiry, X, F> {
 }
 
 impl<'a, B, E, F> RunBuilder<'a, B, E, HasXfetch, F> {
+    /// Overrides the XFetch beta parameter for this single call.
     pub fn beta(mut self, beta: f64) -> Self {
         self.beta_override = Some(beta);
         self
@@ -229,7 +247,7 @@ where
                 let work = work.clone();
                 move || {
                     let work = work.clone();
-                    async move { work().await.map(ComputeValue::cache) }
+                    async move { work().await.map(ComputeValue::new) }
                 }
             };
 
@@ -326,6 +344,7 @@ pub struct CacheFlight<B, E, X> {
     cache: Arc<B>,
     metrics: Arc<dyn MetricsHooks>,
     config: EntryConfig,
+    flight_timeout: Duration,
     flights: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
     _phantom: PhantomData<(E, X)>,
 }
@@ -336,6 +355,7 @@ impl<B, E, X> Clone for CacheFlight<B, E, X> {
             cache: Arc::clone(&self.cache),
             metrics: Arc::clone(&self.metrics),
             config: self.config,
+            flight_timeout: self.flight_timeout,
             flights: Arc::clone(&self.flights),
             _phantom: PhantomData,
         }
@@ -345,10 +365,12 @@ impl<B, E, X> Clone for CacheFlight<B, E, X> {
 // ── Construction (NoExpiry, NoXfetch) ───────────────────────────────────────
 
 impl<B: CacheBackend> CacheFlight<B, NoExpiry, NoXfetch> {
+    /// Creates a new `CacheFlight` instance with a no-op metrics hook.
     pub fn new(cache: B) -> Self {
         Self::with_metrics(cache, NoopMetrics)
     }
 
+    /// Creates a new `CacheFlight` instance with the given metrics hook.
     pub fn with_metrics(cache: B, metrics: impl MetricsHooks) -> Self {
         Self {
             cache: Arc::new(cache),
@@ -359,11 +381,25 @@ impl<B: CacheBackend> CacheFlight<B, NoExpiry, NoXfetch> {
                 },
                 beta: None,
             },
+            flight_timeout: Duration::from_secs(30),
             flights: Arc::new(Mutex::new(HashMap::new())),
             _phantom: PhantomData,
         }
     }
 
+    /// Sets the maximum time a caller waits for an in-flight recompute
+    /// before giving up with a timeout error.
+    ///
+    /// Defaults to 30 seconds.
+    pub fn flight_timeout(mut self, timeout: Duration) -> Self {
+        self.flight_timeout = timeout;
+        self
+    }
+
+    /// Configures a flat TTL (time-to-live) expiry strategy.
+    ///
+    /// Once the TTL expires, cached entries are treated as stale and a
+    /// fresh recompute blocks all concurrent callers.
     pub fn ttl(self, duration: Duration) -> CacheFlight<B, HasFlatExpiry, NoXfetch> {
         CacheFlight {
             cache: self.cache,
@@ -372,11 +408,17 @@ impl<B: CacheBackend> CacheFlight<B, NoExpiry, NoXfetch> {
                 expiry: ExpiryStrategy::Flat { ttl: duration },
                 beta: None,
             },
+            flight_timeout: self.flight_timeout,
             flights: self.flights,
             _phantom: PhantomData,
         }
     }
 
+    /// Configures a stale-while-revalidate expiry strategy.
+    ///
+    /// Entries are considered fresh for `fresh` and remain usable (stale)
+    /// for an additional `stale` during which a background refresh is
+    /// triggered without blocking callers.
     pub fn stale_while_revalidate(
         self,
         fresh: Duration,
@@ -392,6 +434,7 @@ impl<B: CacheBackend> CacheFlight<B, NoExpiry, NoXfetch> {
                 },
                 beta: None,
             },
+            flight_timeout: self.flight_timeout,
             flights: self.flights,
             _phantom: PhantomData,
         }
@@ -401,6 +444,10 @@ impl<B: CacheBackend> CacheFlight<B, NoExpiry, NoXfetch> {
 // ── Add XFetch on top of any expiry strategy ───────────────────────────────
 
 impl<B: CacheBackend, X> CacheFlight<B, HasFlatExpiry, X> {
+    /// Enables probabilistic early expiration (XFetch) with the given `beta`.
+    ///
+    /// When `beta > 0`, the engine may trigger a background refresh before
+    /// the TTL expires. Higher values make early refreshes more likely.
     pub fn probabilistic_expiry(self, beta: f64) -> CacheFlight<B, HasFlatExpiry, HasXfetch> {
         CacheFlight {
             cache: self.cache,
@@ -409,6 +456,7 @@ impl<B: CacheBackend, X> CacheFlight<B, HasFlatExpiry, X> {
                 expiry: self.config.expiry,
                 beta: Some(beta),
             },
+            flight_timeout: self.flight_timeout,
             flights: self.flights,
             _phantom: PhantomData,
         }
@@ -416,6 +464,10 @@ impl<B: CacheBackend, X> CacheFlight<B, HasFlatExpiry, X> {
 }
 
 impl<B: CacheBackend, X> CacheFlight<B, HasSwrExpiry, X> {
+    /// Enables probabilistic early expiration (XFetch) with the given `beta`.
+    ///
+    /// Works identically to the flat-TTL variant — early refreshes may
+    /// fire during the fresh window.
     pub fn probabilistic_expiry(self, beta: f64) -> CacheFlight<B, HasSwrExpiry, HasXfetch> {
         CacheFlight {
             cache: self.cache,
@@ -424,23 +476,51 @@ impl<B: CacheBackend, X> CacheFlight<B, HasSwrExpiry, X> {
                 expiry: self.config.expiry,
                 beta: Some(beta),
             },
+            flight_timeout: self.flight_timeout,
             flights: self.flights,
             _phantom: PhantomData,
         }
     }
 
+    /// Returns the configured fresh TTL.
     pub fn fresh_ttl(&self) -> Duration {
         self.config.expiry.fresh_ttl()
     }
 
+    /// Returns the configured stale TTL.
     pub fn stale_ttl(&self) -> Duration {
         self.config.expiry.stale_ttl()
+    }
+}
+
+// ── Accessors for Flat TTL ─────────────────────────────────────────────────
+
+impl<B: CacheBackend, X> CacheFlight<B, HasFlatExpiry, X> {
+    /// Returns the configured flat TTL duration.
+    pub fn ttl_duration(&self) -> Duration {
+        match self.config.expiry {
+            ExpiryStrategy::Flat { ttl } => ttl,
+            _ => unreachable!("type-state guarantees HasFlatExpiry"),
+        }
+    }
+}
+
+// ── Accessors for XFetch ───────────────────────────────────────────────────
+
+impl<B: CacheBackend, E> CacheFlight<B, E, HasXfetch> {
+    /// Returns the configured XFetch beta parameter, if any.
+    pub fn beta(&self) -> Option<f64> {
+        self.config.beta
     }
 }
 
 // ── run() — gated on HasFlatExpiry ──────────────────────────────────────────
 
 impl<B: CacheBackend, X> CacheFlight<B, HasFlatExpiry, X> {
+    /// Runs the work closure for the given key, deduplicating concurrent
+    /// callers and returning the cached or freshly computed value.
+    ///
+    /// Returns a [`RunBuilder`] that supports per-call overrides (e.g. `ttl()`).
     pub fn run<F, Fut>(
         &self,
         key: impl Into<String>,
@@ -464,6 +544,11 @@ impl<B: CacheBackend, X> CacheFlight<B, HasFlatExpiry, X> {
 // ── run() — gated on HasSwrExpiry ──────────────────────────────────────────
 
 impl<B: CacheBackend, X> CacheFlight<B, HasSwrExpiry, X> {
+    /// Runs the work closure for the given key, deduplicating concurrent
+    /// callers and returning the cached or freshly computed value.
+    ///
+    /// Returns a [`RunBuilder`] that supports per-call overrides
+    /// (e.g. `fresh_for()`, `stale_for()`).
     pub fn run<F, Fut>(
         &self,
         key: impl Into<String>,
@@ -481,6 +566,25 @@ impl<B: CacheBackend, X> CacheFlight<B, HasSwrExpiry, X> {
             stale_override: None,
             beta_override: None,
         }
+    }
+}
+
+// ── Invalidation API (available on all variants) ─────────────────────────────
+
+impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheFlight<B, E, X> {
+    /// Removes the cached entry for `key` from the backend.
+    ///
+    /// The next call to [`run`](Self::run) for this key will result in a
+    /// cold miss and trigger a fresh recompute.
+    pub async fn invalidate(&self, key: &str) -> Result<()> {
+        self.cache.delete(key).await
+    }
+
+    /// Removes all cached entries whose key starts with `prefix`.
+    ///
+    /// Returns the number of entries that were removed.
+    pub async fn invalidate_prefix(&self, prefix: &str) -> Result<u64> {
+        self.cache.delete_by_prefix(prefix).await
     }
 }
 
@@ -521,10 +625,18 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
                 return result.map(|value| LookupResult::new((*value).clone(), state));
             }
 
-            if receiver.changed().await.is_err() {
-                return Err(Error::internal(
-                    "the in-flight leader finished without publishing a result",
-                ));
+            match tokio::time::timeout(self.flight_timeout, receiver.changed()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => {
+                    return Err(Error::internal(
+                        "the in-flight leader finished without publishing a result",
+                    ));
+                }
+                Err(_) => {
+                    return Err(Error::internal(
+                        "timed out waiting for the in-flight recompute to complete",
+                    ));
+                }
             }
         }
     }
@@ -550,10 +662,10 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
 
         let this = self.clone();
         tokio::spawn(async move {
-            let _ = this
+            let result = this
                 .run_recompute(
                     RecomputeParams {
-                        key,
+                        key: key.clone(),
                         flight,
                         total_ttl,
                         fresh_ttl,
@@ -564,14 +676,13 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
                     work,
                 )
                 .await;
+            if let Err(error) = result {
+                this.metrics.on_background_refresh_failed(&key, reason, &error);
+            }
         });
     }
 
-    async fn run_recompute<F, Fut>(
-        &self,
-        p: RecomputeParams,
-        work: F,
-    ) -> Result<LookupResult>
+    async fn run_recompute<F, Fut>(&self, p: RecomputeParams, work: F) -> Result<LookupResult>
     where
         F: Fn() -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<ComputeValue>> + Send + 'static,
@@ -581,18 +692,20 @@ impl<B: CacheBackend, E: Send + Sync + 'static, X: Send + Sync + 'static> CacheF
 
         let result = match work().await {
             Ok(computed) => {
-                let (value, should_cache) = computed.into_parts();
+                let value = computed.into_value();
 
-                if should_cache {
-                    let elapsed = started_at.elapsed();
-                    let delta_ema = compute_new_delta_ema(p.previous_delta_ema, elapsed);
-                    let stale_ttl = p.total_ttl.checked_sub(p.fresh_ttl).unwrap_or(Duration::ZERO);
-                    let encoded_entry =
-                        encode_cached_entry(&value, p.fresh_ttl, stale_ttl, delta_ema);
+                let elapsed = started_at.elapsed();
+                let delta_ema = compute_new_delta_ema(p.previous_delta_ema, elapsed);
+                let max_delta = duration_to_millis_f64(p.fresh_ttl).max(1.0) * 2.0;
+                let delta_ema = delta_ema.min(max_delta);
+                let stale_ttl = p
+                    .total_ttl
+                    .checked_sub(p.fresh_ttl)
+                    .unwrap_or(Duration::ZERO);
+                let encoded_entry = encode_cached_entry(&value, p.fresh_ttl, stale_ttl, delta_ema);
 
-                    if let Err(error) = self.cache.set(&p.key, encoded_entry, p.total_ttl).await {
-                        self.metrics.on_cache_write_failed(&p.key, &error);
-                    }
+                if let Err(error) = self.cache.set(&p.key, encoded_entry, p.total_ttl).await {
+                    self.metrics.on_cache_write_failed(&p.key, &error);
                 }
 
                 Ok(Arc::new(value))

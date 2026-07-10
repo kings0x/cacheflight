@@ -50,6 +50,8 @@ pub trait MetricsHooks: Send + Sync + 'static {
     fn on_cache_write_failed(&self, _key: &str, _error: &Error) {}
 
     fn on_xfetch_early_refresh(&self, _key: &str) {}
+
+    fn on_background_refresh_failed(&self, _key: &str, _reason: RecomputeReason, _error: &Error) {}
 }
 
 #[derive(Debug, Default, Clone, Copy)]

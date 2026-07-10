@@ -1,105 +1,11 @@
 #![allow(dead_code)]
 
-use cacheflight::{
-    CacheBackend, CacheMissReason, Error, MetricsHooks, RecomputeOutcome, RecomputeReason, Result,
-    async_trait,
-};
+use cacheflight::{CacheMissReason, Error, MetricsHooks, RecomputeOutcome, RecomputeReason};
 use std::{
-    collections::HashMap,
-    io,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{sync::Mutex as AsyncMutex, time::sleep};
-
-#[derive(Clone, Default)]
-pub struct MemoryCache {
-    entries: Arc<AsyncMutex<HashMap<String, CacheEntry>>>,
-    fail_next_get: Arc<AtomicUsize>,
-    fail_next_set: Arc<AtomicUsize>,
-}
-
-#[derive(Clone)]
-struct CacheEntry {
-    value: Vec<u8>,
-    expires_at: Instant,
-}
-
-impl MemoryCache {
-    pub fn fail_one_get(&self) {
-        self.fail_next_get.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub fn fail_one_set(&self) {
-        self.fail_next_set.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub async fn insert_raw(&self, key: impl Into<String>, value: Vec<u8>, ttl: Duration) {
-        self.entries.lock().await.insert(
-            key.into(),
-            CacheEntry {
-                value,
-                expires_at: Instant::now() + ttl,
-            },
-        );
-    }
-}
-
-#[async_trait]
-impl CacheBackend for MemoryCache {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let should_fail = self
-            .fail_next_get
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
-                (pending > 0).then(|| pending - 1)
-            })
-            .is_ok();
-
-        if should_fail {
-            return Err(Error::cache_read(io::Error::other(
-                "forced cache read failure",
-            )));
-        }
-
-        let mut entries = self.entries.lock().await;
-
-        match entries.get(key) {
-            Some(entry) if entry.expires_at > Instant::now() => Ok(Some(entry.value.clone())),
-            Some(_) => {
-                entries.remove(key);
-                Ok(None)
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<()> {
-        let should_fail = self
-            .fail_next_set
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
-                (pending > 0).then(|| pending - 1)
-            })
-            .is_ok();
-
-        if should_fail {
-            return Err(Error::cache_write(io::Error::other(
-                "forced cache write failure",
-            )));
-        }
-
-        self.entries.lock().await.insert(
-            key.to_owned(),
-            CacheEntry {
-                value,
-                expires_at: Instant::now() + ttl,
-            },
-        );
-        Ok(())
-    }
-}
+use tokio::time::sleep;
 
 #[derive(Clone, Default)]
 pub struct TestMetrics {
@@ -117,6 +23,7 @@ pub struct MetricsSnapshot {
     pub recompute_started: Vec<RecomputeReason>,
     pub recompute_finished: Vec<(RecomputeReason, RecomputeOutcome)>,
     pub xfetch_early_refreshes: usize,
+    pub background_refresh_failures: usize,
 }
 
 impl TestMetrics {
@@ -126,6 +33,13 @@ impl TestMetrics {
 }
 
 impl MetricsHooks for TestMetrics {
+    fn on_background_refresh_failed(&self, _key: &str, _reason: RecomputeReason, _error: &Error) {
+        self.inner
+            .lock()
+            .expect("metrics mutex poisoned")
+            .background_refresh_failures += 1;
+    }
+
     fn on_cache_hit(&self, _key: &str) {
         self.inner.lock().expect("metrics mutex poisoned").hits += 1;
     }

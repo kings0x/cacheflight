@@ -32,6 +32,7 @@ mod cacheflight;
 mod error;
 mod memory;
 mod metrics;
+#[cfg(feature = "redis")]
 mod redis;
 
 pub use async_trait::async_trait;
@@ -43,4 +44,5 @@ pub use cacheflight::{
 pub use error::{Error, ErrorSource, Result};
 pub use memory::MemoryCache;
 pub use metrics::{CacheMissReason, MetricsHooks, NoopMetrics, RecomputeOutcome, RecomputeReason};
+#[cfg(feature = "redis")]
 pub use redis::RedisCache;
