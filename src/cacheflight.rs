@@ -520,7 +520,7 @@ impl<B: CacheBackend, X> CacheFlight<B, HasFlatExpiry, X> {
     /// Runs the work closure for the given key, deduplicating concurrent
     /// callers and returning the cached or freshly computed value.
     ///
-    /// Returns a [`RunBuilder`] that supports per-call overrides (e.g. `ttl()`).
+    /// Returns a `RunBuilder` that supports per-call overrides (e.g. `ttl()`).
     pub fn run<F, Fut>(
         &self,
         key: impl Into<String>,
@@ -547,7 +547,7 @@ impl<B: CacheBackend, X> CacheFlight<B, HasSwrExpiry, X> {
     /// Runs the work closure for the given key, deduplicating concurrent
     /// callers and returning the cached or freshly computed value.
     ///
-    /// Returns a [`RunBuilder`] that supports per-call overrides
+    /// Returns a `RunBuilder` that supports per-call overrides
     /// (e.g. `fresh_for()`, `stale_for()`).
     pub fn run<F, Fut>(
         &self,

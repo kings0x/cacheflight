@@ -1,14 +1,17 @@
 # `cacheflight`
 
-`cacheflight` deduplicates concurrent async work for the same key and stores the result in a user-provided cache backend. It supports plain cache hits, cold-miss coordination, and stale-while-revalidate refreshes without forcing a specific cache store or serialization format.
+`cacheflight` deduplicates concurrent async work for the same cache key and stores the result in a user-provided cache backend. It supports flat TTL, stale-while-revalidate (SWR), and probabilistic early expiration (XFetch) — all without forcing a specific cache store or serialization format.
 
-## What it gives you
+## Features
 
-- A small `CacheBackend` trait for plugging in Redis, Memcached, in-process caches, or your own store.
-- A core `SingleFlight` engine for non-HTTP workloads.
-- Optional Tower/Axum-friendly middleware helpers for request deduplication and cached response replay.
-- Metrics hooks for production observability.
-- Safe fallback behavior when cache reads fail: the engine recomputes instead of failing the caller.
+- **Cold-miss deduplication** — when N callers race for the same missing key, only one recomputes; the rest share the result.
+- **Stale-while-revalidate** — serve a stale value immediately while a background refresh runs.
+- **Probabilistic early expiration (XFetch)** — trigger background refreshes before the TTL expires, proportional to compute time, smoothing out thundering herds.
+- **Type-state API** — invalid configurations are caught at compile time (e.g. calling `stale_for()` on a flat-TTL instance won't compile).
+- **Plugable backends** — implement `CacheBackend` for any store, or use the built-in `MemoryCache` or `RedisCache`.
+- **Observability hooks** — `MetricsHooks` trait with no-op defaults, re-implement for production metrics.
+- **Safe fallback** — cache read failures degrade to recompute instead of failing the caller.
+- **Cache invalidation** — `invalidate(key)` and `invalidate_prefix(prefix)` to evict entries programmatically.
 
 ## Installation
 
@@ -17,88 +20,184 @@
 cacheflight = "0.1"
 ```
 
-## Core example
+Redis support is included by default. To use only the in-memory backend:
+
+```toml
+[dependencies]
+cacheflight = { version = "0.1", default-features = false }
+```
+
+## Quick start
 
 ```rust
-use cacheflight::{CacheBackend, CachePolicy, Result, SingleFlight, async_trait};
-use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
-use tokio::sync::Mutex;
+use cacheflight::{CacheFlight, MemoryCache, LookupState};
+use std::time::Duration;
 
-#[derive(Clone, Default)]
-struct MemoryCache {
-    inner: Arc<Mutex<HashMap<String, (Vec<u8>, Instant)>>>,
+#[tokio::main]
+async fn main() -> cacheflight::Result<()> {
+    let cf = CacheFlight::new(MemoryCache::new())
+        .ttl(Duration::from_secs(30));
+
+    // Five concurrent callers — only one recomputes.
+    let mut tasks = Vec::new();
+    for _ in 0..5 {
+        let cf = cf.clone();
+        tasks.push(tokio::spawn(async move {
+            cf.run("user:42", || async {
+                // This runs only once.
+                Ok(br#"{"id":42,"name":"Ada"}"#.to_vec())
+            }).await
+        }));
+    }
+
+    for task in tasks {
+        let result = task.await??;
+        println!("state={:?}, value={}", result.state(), String::from_utf8_lossy(result.value()));
+    }
+
+    // Subsequent reads hit the cache.
+    let cached = cf.run("user:42", || async {
+        unreachable!("should not recompute")
+    }).await?;
+    assert_eq!(cached.state(), LookupState::CacheHit);
+
+    // Invalidate when the underlying data changes.
+    cf.invalidate("user:42").await?;
+
+    Ok(())
 }
+```
+
+## Backends
+
+### MemoryCache (built-in, no extra dependencies)
+
+An in-process cache backed by `DashMap`. Supports failure injection for testing:
+
+```rust
+use cacheflight::MemoryCache;
+
+let cache = MemoryCache::new();
+cache.fail_one_get();   // next get() fails with a cache read error
+cache.fail_one_set();   // next set() fails with a cache write error
+cache.insert_raw("k", b"raw".to_vec(), ttl); // bypasses wire format
+```
+
+### RedisCache (behind the `redis` feature, enabled by default)
+
+```rust
+use cacheflight::RedisCache;
+
+let cache = RedisCache::new("redis://127.0.0.1/").await?;
+```
+
+### Custom backend
+
+Implement `CacheBackend` for any store:
+
+```rust
+use cacheflight::{CacheBackend, Result, async_trait};
+use std::time::Duration;
 
 #[async_trait]
-impl CacheBackend for MemoryCache {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let mut guard = self.inner.lock().await;
-
-        match guard.get(key) {
-            Some((value, expires_at)) if *expires_at > Instant::now() => Ok(Some(value.clone())),
-            Some(_) => {
-                guard.remove(key);
-                Ok(None)
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<()> {
-        self.inner
-            .lock()
-            .await
-            .insert(key.to_owned(), (value, Instant::now() + ttl));
-        Ok(())
-    }
+impl CacheBackend for MyStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> { /* ... */ }
+    async fn set(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<()> { /* ... */ }
+    async fn delete(&self, key: &str) -> Result<()> { /* ... */ }
+    async fn delete_by_prefix(&self, prefix: &str) -> Result<u64> { /* ... */ }
 }
+```
 
-# async fn demo() -> Result<()> {
-let cache = MemoryCache::default();
-let policy = CachePolicy::new(Duration::from_secs(30))
-    .with_stale_while_revalidate(Duration::from_secs(120));
-let singleflight = SingleFlight::new(cache, policy);
+## Expiry strategies
 
-let result = singleflight
-    .get_or_compute("user:42", || async {
-        Ok(br#"{"id":42,"name":"Ada"}"#.to_vec())
-    })
+The API uses Rust's type system to guide configuration:
+
+### Flat TTL
+
+```rust
+let cf = CacheFlight::new(cache)
+    .ttl(Duration::from_secs(30));
+```
+
+Once the TTL expires, the entry is treated as expired and the next caller recomputes.
+
+### Stale-while-revalidate
+
+```rust
+let cf = CacheFlight::new(cache)
+    .stale_while_revalidate(
+        Duration::from_secs(30),   // fresh window
+        Duration::from_secs(120),  // stale window
+    );
+```
+
+Callers within the fresh window get a `CacheHit`. During the stale window, callers get the stale value immediately while a **single** background refresh runs. If multiple callers arrive during the stale window, they all share the same in-flight refresh.
+
+### Probabilistic early expiration (XFetch)
+
+```rust
+let cf = CacheFlight::new(cache)
+    .ttl(Duration::from_secs(30))
+    .probabilistic_expiry(2.0);
+```
+
+XFetch may trigger a background refresh *before* the TTL expires, based on the smoothed compute duration (delta EMA) and the `beta` parameter. Higher `beta` makes early refreshes more likely. Callers see `CacheHit` while the refresh runs in the background.
+
+XFetch also works on top of SWR:
+
+```rust
+let cf = CacheFlight::new(cache)
+    .stale_while_revalidate(Duration::from_secs(30), Duration::from_secs(120))
+    .probabilistic_expiry(2.0);
+```
+
+## Per-call overrides
+
+The `run()` method returns a `RunBuilder` that supports per-call overrides:
+
+```rust
+cf.run("key", work)
+    .ttl(Duration::from_secs(10))          // flat TTL only
     .await?;
 
-assert_eq!(result.value(), br#"{"id":42,"name":"Ada"}"#);
-# Ok(())
-# }
+cf.run("key", work)
+    .fresh_for(Duration::from_secs(5))     // SWR only
+    .stale_for(Duration::from_secs(60))    // SWR only
+    .await?;
+
+cf.run("key", work)
+    .beta(4.0)                              // XFetch only
+    .await?;
 ```
 
-## HTTP middleware safety notes
+## Cache invalidation
 
-The HTTP layer is intentionally conservative, but it is still application-level caching middleware, not a full RFC cache.
+```rust
+// Invalidate a single key.
+cf.invalidate("user:42").await?;
 
-- By default it only caches `GET` and `HEAD`.
-- It bypasses requests carrying `Authorization`, `Proxy-Authorization`, `Cookie`, or `Range`.
-- Default keys include method, host, path, normalized query ordering, and common `Accept*` headers.
-- It buffers full response bodies before replaying them from cache, so set `max_response_bytes` to a value that fits your workload.
-- If responses vary on tenant IDs, locale headers, feature flags, or other request metadata, use `key_with` to include that variance explicitly.
-
-## Benchmarks
-
-Yes, benchmarks are worth having for this crate because its value is mostly about coordination overhead under load. The included Criterion benchmark covers cache-hit and contended cold-miss paths:
-
-```bash
-cargo bench
+// Invalidate all keys matching a prefix.
+let count = cf.invalidate_prefix("session:").await?;
+println!("invalidated {count} sessions");
 ```
 
-For a real release process, it is worth tracking benchmark results over time so regressions in lock contention, request fan-in, or HTTP buffering show up before publish.
+## Metrics
 
-## Status
+Implement `MetricsHooks` to observe cache behavior. All methods have no-op defaults — override only what you need. See [docs.rs](https://docs.rs/cacheflight) for the full trait definition.
 
-The crate ships with tests for:
+```rust
+use cacheflight::{MetricsHooks, CacheMissReason, RecomputeReason};
 
-- concurrent cold-miss deduplication
-- stale-while-revalidate refresh behavior
-- shared error propagation
-- cache read/write failure handling
-- Tower integration
-- HTTP middleware defaults and safety guards
+struct MyMetrics;
 
-API docs: <https://docs.rs/cacheflight>
+impl MetricsHooks for MyMetrics {
+    fn on_cache_hit(&self, key: &str) { /* ... */ }
+    fn on_cache_miss(&self, key: &str, reason: CacheMissReason) { /* ... */ }
+}
+
+let cf = CacheFlight::with_metrics(cache, MyMetrics).ttl(Duration::from_secs(30));
+```
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-Apache-2.0) at your option.

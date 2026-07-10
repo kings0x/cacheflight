@@ -1,7 +1,7 @@
 use std::{error::Error as StdError, fmt, sync::Arc};
 use thiserror::Error;
 
-/// Wraps an inner error for use as a source in [`Error`].
+/// Wraps an inner error for use as a source in [`enum@Error`].
 #[derive(Debug)]
 pub struct ErrorSource(Arc<dyn StdError + Send + Sync>);
 
