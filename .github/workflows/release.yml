@@ -42,6 +42,7 @@ jobs:
   publish:
     needs: [check, fmt, clippy, test]
     runs-on: ubuntu-latest
+    environment: publish
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
