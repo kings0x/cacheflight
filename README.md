@@ -87,8 +87,10 @@ cache.insert_raw("k", b"raw".to_vec(), ttl); // bypasses wire format
 
 ```rust
 use cacheflight::RedisCache;
+use redis::aio::ConnectionManager;
 
-let cache = RedisCache::new("redis://127.0.0.1/").await?;
+let conn = ConnectionManager::new(client).await?;
+let cache = RedisCache::new(conn);
 ```
 
 ### Custom backend

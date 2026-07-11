@@ -8,13 +8,12 @@ pub struct RedisCache {
 }
 
 impl RedisCache {
-    /// Creates a new Redis-backed cache from a connection URL.
-    pub async fn new(url: &str) -> Result<Self> {
-        let client = redis::Client::open(url).map_err(|e| Error::internal(e.to_string()))?;
-        let conn = ConnectionManager::new(client)
-            .await
-            .map_err(|e| Error::internal(e.to_string()))?;
-        Ok(Self { conn })
+    /// Creates a new Redis-backed cache from an existing [`ConnectionManager`].
+    ///
+    /// The caller is responsible for creating and configuring the connection
+    /// (e.g. TLS, timeouts, sentinel, pool integration).
+    pub fn new(conn: ConnectionManager) -> Self {
+        Self { conn }
     }
 }
 
