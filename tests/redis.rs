@@ -1,9 +1,10 @@
 #![cfg(feature = "redis")]
 
 use cacheflight::{CacheFlight, LookupState, RedisCache, Result};
+use redis::aio::ConnectionManager;
 use std::time::Duration;
 
-fn redis_url() -> String {
+fn redis_conn() -> ConnectionManager {
     use testcontainers::GenericImage;
     use testcontainers::clients::Cli;
 
@@ -12,7 +13,12 @@ fn redis_url() -> String {
     let container = client.run(image);
     let port = container.get_host_port_ipv4(6379);
     std::mem::forget(container);
-    format!("redis://127.0.0.1:{port}/")
+    let url = format!("redis://127.0.0.1:{port}/");
+    let client = redis::Client::open(url).expect("invalid redis url");
+    tokio::runtime::Runtime::new()
+        .expect("tokio runtime")
+        .block_on(ConnectionManager::new(client))
+        .expect("connection manager")
 }
 
 /// Requires Docker to be running.
@@ -20,8 +26,8 @@ fn redis_url() -> String {
 #[ignore]
 #[tokio::test]
 async fn redis_cache_basic_dedup() -> Result<()> {
-    let url = redis_url();
-    let cache = RedisCache::new(&url).await?;
+    let conn = redis_conn();
+    let cache = RedisCache::new(conn);
     let cf = CacheFlight::new(cache).ttl(Duration::from_secs(30));
 
     let result = cf
@@ -48,8 +54,8 @@ async fn redis_cache_basic_dedup() -> Result<()> {
 #[ignore]
 #[tokio::test]
 async fn redis_cache_with_swr() -> Result<()> {
-    let url = redis_url();
-    let cache = RedisCache::new(&url).await?;
+    let conn = redis_conn();
+    let cache = RedisCache::new(conn);
     let cf = CacheFlight::new(cache)
         .stale_while_revalidate(Duration::from_millis(100), Duration::from_secs(10));
 
