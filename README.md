@@ -17,14 +17,14 @@
 
 ```toml
 [dependencies]
-cacheflight = "0.1"
+cacheflight = "0.2"
 ```
 
 Redis support is included by default. To use only the in-memory backend:
 
 ```toml
 [dependencies]
-cacheflight = { version = "0.1", default-features = false }
+cacheflight = { version = "0.2", default-features = false }
 ```
 
 ## Quick start
